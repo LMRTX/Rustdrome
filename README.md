@@ -8,7 +8,8 @@ Originally started out as a rewrite of the [NaviTui](https://github.com/Gheat1/N
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=flat-square&logo=gnu&logoColor=white)](LICENSE)
 [![Rust 1.84+](https://img.shields.io/badge/Rust-1.84%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Built with Ratatui](https://img.shields.io/badge/Built%20with-Ratatui-8A2BE2?style=flat-square)](https://ratatui.rs/)
+[![Built with Ratatui](https://img.shields.io/badge/Built%20with-Ratatui-8A2BE2?style=flat-square&logo=ratatui&logoColor=white)](https://ratatui.rs/)
+
 
 
 <table>
