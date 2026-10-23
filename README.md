@@ -39,7 +39,7 @@ cd rustdrome
 chmod +x ./install
 ./install
 ```
-
+Then just launch the application with `rustdrome` in your terminal.
 
 
 ## Building from Source
