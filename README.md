@@ -2,7 +2,7 @@
 
 **A lightweight, beautiful & blazing-fast terminal music client for [Navidrome](https://www.navidrome.org/) and any Subsonic-compatible server.**
 
-Rust-based responsive TUI built with ratatui and mpv used for playback.
+Rust-based responsive TUI built with ratatui which uses mpv for playback.
 
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
 
