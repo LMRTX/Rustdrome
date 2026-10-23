@@ -1,0 +1,256 @@
+# Rustdrome
+
+**A lightweight, beautiful & blazing fast terminal music client for [Navidrome](https://www.navidrome.org/) and any Subsonic-compatible server.**
+
+Rust-based responsive TUI built with ratatui and with mpv for playback.
+
+[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
+
+## Install
+
+### Dependencies
+
+Rustdrome requires **`mpv` on your `PATH` at runtime**. It does not require libmpv development headers to build.
+
+Install mpv using your distribution's package manager:
+
+**Arch Linux**
+```sh
+sudo pacman -S mpv
+```
+
+**Debian / Ubuntu**
+```sh
+sudo apt install mpv
+```
+
+**Fedora**
+```sh
+sudo dnf install mpv
+```
+
+### Precompiled binary
+
+The precompiled binary targets Unix systems with **glibc 2.39 or newer**.
+
+```sh
+git clone https://github.com/LMRTX/rustdrome
+cd rustdrome
+chmod +x ./install
+./install
+```
+
+
+
+## Building from Source
+
+Rustdrome requires **Rust 1.84 or newer**.
+
+```sh
+git clone https://github.com/LMRTX/rustdrome --branch source
+cd rustdrome
+cargo build --release
+./target/release/rustdrome
+```
+
+For convenient access, move the compiled binary somewhere on your `PATH`, such as:
+
+```sh
+mkdir -p ~/.local/bin
+cp ./target/release/rustdrome ~/.local/bin/
+```
+
+Make sure `~/.local/bin` is included in your `PATH`.
+
+
+
+## Keybindings
+
+Press `?` inside Rustdrome to see the complete in-app keybinding reference.
+
+Most actions can be remapped in `player.toml`. List navigation, `enter`, and the `1`–`5` rating keys are fixed.
+
+### Playback & transport
+
+| Key | Action |
+|---|---|
+| `space` | Play / pause |
+| `n` / `b` | Next / previous track |
+| `←` / `→` | Seek 5 seconds |
+| `-` / `+` | Decrease / increase volume |
+| `s` | Shuffle |
+| `r` | Repeat |
+| `i` | Start radio |
+
+### Library & navigation
+
+| Key | Action |
+|---|---|
+| `/` | Search |
+| `\` | Filter the current list |
+| `v` | Select mode |
+| `y` | Browse genres |
+| `enter` | Activate selection |
+
+### Queue & playlists
+
+| Key | Action |
+|---|---|
+| `a` | Add to queue |
+| `A` | Play next |
+| `p` / `P` | Add / remove playlist |
+| `f` | Star / unstar track |
+| `1`–`5` | Rate track |
+
+### Downloads & display
+
+| Key | Action |
+|---|---|
+| `d` / `D` | Download |
+| `O` | Toggle offline mode |
+| `L` | Lyrics |
+| `z` | Zen mode |
+| `t` / `T` | Theme |
+| `ctrl+p` | Command palette |
+
+
+## Files and Compatibility
+
+Rustdrome stores its configuration and application data in the following locations for new installations:
+
+| Location | Purpose |
+|---|---|
+| `~/.config/rustdrome/` | Configuration files |
+| `~/.local/state/rustdrome/` | Persistent application state |
+| `~/.cache/rustdrome/` | Library caches, cover art, and offline downloads |
+
+**Upgrading from NaviTui is supported.** If an existing `navitui` configuration is present and no Rustdrome configuration exists, Rustdrome continues using the existing NaviTui directories. This preserves your login, queue, cache, and offline downloads.
+
+The file formats remain compatible with the original Python NaviTui.
+
+### Important files
+
+| File or directory | Purpose |
+|---|---|
+| `config.toml` | Server configuration and salted authentication token |
+| `player.toml` | Settings and keybindings |
+| `state.json` | Theme, volume, current view, shuffle, and resume position |
+| `queue.json` | Playback queue |
+| `*.json` | Cached library data |
+| `mutations.json` | Pending stars, ratings, and scrobbles |
+| `plays.jsonl` | Listening statistics |
+| `art/` | Cover-art cache |
+| `audio/` | Offline music downloads |
+
+Configuration files containing authentication tokens should be protected with restrictive permissions, such as `chmod 600`.
+
+## Features
+
+### Library & discovery
+
+- Browse all tracks, newest additions, recently played tracks, most-played songs, and starred tracks.
+- Shuffle your entire library.
+- Search your music library and filter the current list.
+- Browse by genre and access podcasts and internet radio.
+- Jump directly to an album or artist.
+- Select multiple tracks for batch operations.
+- Navigate lists with vim-style movement and repeat counts.
+
+### Playback & queue
+
+- Play, pause, skip, seek, and adjust volume.
+- Add tracks to the queue or schedule them to play next.
+- Edit queue order and manage upcoming tracks.
+- Shuffle and repeat playback.
+- Start radio from your music and discover similar tracks.
+- Resume where you left off.
+- Control playback speed and configure a sleep timer.
+- Enable crossfade, ReplayGain, and gapless playback through mpv.
+- Prefetch the next track for smoother transitions.
+
+### Offline listening
+
+- Download individual tracks or collections.
+- Keep music available without a network connection.
+- Enable offline mode to play downloaded tracks.
+- Cache cover art and library data locally.
+- Queue stars, ratings, and scrobbles made offline, then sync them later.
+- Preserve original audio files for offline downloads.
+
+### Lyrics & now playing
+
+- View synced and plain lyrics.
+- Use Zen mode for a distraction-free listening experience.
+- Display album art using sixel or half-cell terminal graphics.
+- Watch the audio visualizer react to mpv's playback loudness meter.
+- Follow animated titles and the dynamic playback progress bar.
+- Copy share links using OSC 52.
+
+### Playlists & organization
+
+- Create and delete playlists.
+- Add or remove tracks.
+- Reorder tracks and rename playlists.
+- Save the current queue as a playlist.
+- Star tracks and assign ratings from one to five.
+- Maintain bookmarks for longer tracks.
+- Review local listening statistics.
+
+### Interface & customization
+
+- Choose from five themes with live preview.
+- Tint the interface using album-art colors.
+- Use the command palette to discover available actions.
+- Navigate with the keyboard or mouse.
+- Customize settings and keybindings through `player.toml`.
+- Receive desktop notifications when tracks change.
+
+
+
+## How It Works
+
+Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
+
+- **Interface:** [ratatui](https://ratatui.rs) provides the terminal user interface.
+- **Playback:** mpv runs as a child process and communicates with Rustdrome through its JSON IPC socket.
+- **Music server:** Rustdrome connects to Navidrome and other Subsonic-compatible servers.
+- **Persistence:** configuration, application state, queue data, and caches are stored locally.
+- **Offline synchronization:** supported mutations are queued locally and synced when the server becomes available again.
+
+By communicating with mpv over IPC instead of linking libmpv, Rustdrome avoids requiring libmpv development headers during compilation.
+
+
+## Differences from NaviTui
+
+Rustdrome started as a rewrite of [NaviTui](https://github.com/Gheat1/NaviTui), preserving its existing file formats and much of its functionality while changing the implementation language and terminal UI framework.
+
+| Area | NaviTui | Rustdrome |
+|---|---|---|
+| Language | Python | Rust |
+| Terminal UI | Textual | ratatui |
+| Playback integration | Python bindings to libmpv | mpv child process over JSON IPC |
+| Platform support | Linux, macOS, and Windows | Unix systems for now |
+| Cover art | Multiple protocols, including Kitty graphics | Sixel or half-cell blocks |
+
+
+### Not yet implemented
+
+The following NaviTui features are not currently implemented in Rustdrome:
+
+- MPRIS and system media keys.
+- Discord Rich Presence.
+- ListenBrainz integration.
+- Remote-control CLI and MCP server.
+- Equalizer.
+- Audio-device and server-profile switchers.
+- SVG now-playing card export.
+- Jukebox mode.
+
+Corresponding `player.toml` keys are ignored.
+
+
+## License
+
+**[GPL-3.0-or-later](https://www.gnu.org/licenses/gpl-3.0.html)**
+
+Rustdrome derives from [NaviTui](https://github.com/Gheat1/NaviTui) and retains its compatible file formats and feature lineage.
