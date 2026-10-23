@@ -6,6 +6,9 @@ Rust-based responsive TUI built with ratatui and with mpv for playback.
 
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
 
+<img width="1905" height="1035" alt="image" src="https://github.com/user-attachments/assets/432068a2-92fa-4bd2-90c5-c157d622ff2d" />
+
+
 ## Install
 
 ### Dependencies
