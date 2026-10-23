@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BINARY="./target/release/rustdrome"
+BINARY="./bin/rustdrome"
 INSTALL_DIR="$HOME/.local/bin"
 
 if [[ ! -f "$BINARY" ]]; then
