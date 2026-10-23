@@ -6,10 +6,13 @@ Rust-based responsive TUI built with ratatui and with mpv for playback.
 
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
 
-<img width="1905" height="1035" alt="image" src="https://github.com/user-attachments/assets/432068a2-92fa-4bd2-90c5-c157d622ff2d" /> <img width="1905" height="1035" alt="image" src="https://github.com/user-attachments/assets/50f787e0-544c-4d39-98c3-052b6373dfc5" />
+<p align="center">
+  <img width="49%" src="https://github.com/user-attachments/assets/432068a2-92fa-4bd2-90c5-c157d622ff2d" alt="Rustdrome Zen Mode screenshot 1" />
+  <img width="49%" src="https://github.com/user-attachments/assets/50f787e0-544c-4d39-98c3-052b6373dfc5" alt="Rustdrome Zen Mode screenshot 2" />
+</p>
 
+<p align="center"><em>Rustdrome Zen Mode</em></p>
 
-*Rustdrome Zen Mode*
 
 ## Install
 
