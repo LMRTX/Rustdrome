@@ -6,7 +6,10 @@ Rustdrome is a Rust-based responsive TUI application built with ratatui which us
 
 Originally started out as a rewrite of the [NaviTui](https://github.com/Gheat1/NaviTui) Project.
 
-[![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=flat-square&logo=gnu&logoColor=white)](LICENSE)
+[![Rust 1.84+](https://img.shields.io/badge/Rust-1.84%2B-orange?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Built with Ratatui](https://img.shields.io/badge/Built%20with-Ratatui-8A2BE2?style=flat-square)](https://ratatui.rs/)
+
 
 <table>
   <tr>
