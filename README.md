@@ -1,6 +1,6 @@
 # Rustdrome
 
-**A lightweight, beautiful & blazing fast terminal music client for [Navidrome](https://www.navidrome.org/) and any Subsonic-compatible server.**
+**A lightweight, beautiful & blazing-fast terminal music client for [Navidrome](https://www.navidrome.org/) and any Subsonic-compatible server.**
 
 Rust-based responsive TUI built with ratatui and with mpv for playback.
 
