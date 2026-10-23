@@ -2,7 +2,9 @@
 
 **A lightweight, beautiful & blazing-fast terminal music client for [Navidrome](https://www.navidrome.org/) and any Subsonic-compatible server.**
 
-Rustdrome is a Rust-based responsive TUI application built with ratatui which uses mpv for playback.
+Rustdrome is a Rust-based responsive TUI application built with ratatui which uses mpv for playback. 
+
+Originally started out as a rewrite of the [NaviTui](https://github.com/Gheat1/NaviTui) Project.
 
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE) · [![rust](https://img.shields.io/badge/rust-1.84%2B-orange)](https://www.rust-lang.org/) · [![built with ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
 
