@@ -117,6 +117,29 @@ try:
     check("zen: album line directly under the title, then a blank row, then the lyrics", al == ti + 1 and not L[al + 1].strip(), f"title {ti} album {al}")
     t.close()
 
+    # ── C2. shrinking the window: the "too small" screen, no crash, full recovery ──
+    t = start(h)
+    seq = [(100, 30), (100, 16), (100, 15), (100, 12), (100, 6), (60, 12), (63, 40), (40, 8), (30, 5), (10, 3), (1, 1)]
+    base = None                                      # images sent as of the moment it first became too small
+    for cols, rows in seq:
+        too_small = cols < 64 or rows < 16
+        if too_small and base is None: base = len(sixel_blobs(t.raw))
+        if too_small: t.set_size(cols, rows); t.pump(0.7)
+        else: n0 = len(sixel_blobs(t.raw)); t.set_size(cols, rows); settle(t, n0)   # a valid size gets its image
+        txt = "\n".join(t.screen.display)
+        if cols >= 26 and rows >= 6:     # the message needs room of its own to be readable
+            shows = "Terminal size too small" in txt
+            right = f"Width = {cols} Height = {rows}" in txt
+            check(f"{cols}x{rows}: " + ("shows 'Terminal size too small' with the live size" if too_small else "shows the normal UI, no message"),
+                  (shows and right and "Needed for current config" in txt and "Width = 64 Height = 16" in txt) if too_small else (not shows and "library" in txt))
+    check("no image is drawn while the terminal is too small", len(sixel_blobs(t.raw)) == base)
+    n = len(sixel_blobs(t.raw)); t.set_size(150, 42); settle(t, n)
+    box_ok = cover_box(t) is not None and "Terminal size too small" not in "\n".join(t.screen.display)
+    check("growing the window brings the whole UI back", box_ok)
+    fits(t, "…and the cover image comes back, fitted to its panel")
+    t.send("?", 0.8); check("…and the app is still responsive (a keypress opens help)", "keys" in "\n".join(t.screen.display)); t.send(KEYS["ESC"], 0.4)
+    t.close()
+
     # ── D. drag-resize the panels ──────────────────────────────────────────
     def press(t, x, y): t.send(f"\x1b[<0;{x+1};{y+1}M", 0.25)
     def drag(t, x, y):  t.send(f"\x1b[<32;{x+1};{y+1}M", 0.25)

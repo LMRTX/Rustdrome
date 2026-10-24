@@ -15,6 +15,28 @@ use crate::queue::Repeat;
 use crate::stats;
 use crate::theme::Theme;
 
+/// Smallest terminal the normal layout works in: the three columns need at
+/// least `14 + 24 + 24` cells (library, tracks, cover/queue), and the rows are
+/// the top bar, ~10 rows of panels, the 4-row now-playing box and the footer.
+pub const MIN_SIZE: (u16, u16) = (64, 16);
+/// Zen mode has no columns, so it needs far less width — but the cover plus its
+/// nine rows of text, plus the bars above and below.
+pub const MIN_SIZE_ZEN: (u16, u16) = (30, 20);
+
+pub fn min_size(zen: bool) -> (u16, u16) {
+    if zen {
+        MIN_SIZE_ZEN
+    } else {
+        MIN_SIZE
+    }
+}
+
+/// `v` limited to `lo..=hi`, never panicking: unlike `Ord::clamp`, an inverted
+/// range (which a small terminal makes easy to produce) just means `hi` wins.
+fn fit(v: u16, lo: u16, hi: u16) -> u16 {
+    v.max(lo).min(hi)
+}
+
 // nerd-font glyphs (same set as the Python version)
 const PLAY: &str = "\u{f04b}";
 const PAUSE: &str = "\u{f04c}";
@@ -168,6 +190,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.overlay_rects.clear();
     f.render_widget(Block::default().style(th.base()), area);
 
+    let (min_w, min_h) = min_size(app.zen);
+    if area.width < min_w || area.height < min_h {
+        // Nothing fits, so draw nothing else — not even a modal. Forget the
+        // hit-boxes too, so a click can't land on a panel that isn't there.
+        app.rects = Rects::default();
+        draw_too_small(f, area, (min_w, min_h), &th);
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(4), Constraint::Length(1)])
@@ -189,6 +220,39 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.modal.is_some() {
         draw_modal(f, app, area, &th);
     }
+}
+
+/// "Terminal size too small" — the current size with each dimension green
+/// when it's enough and red when it isn't, and what's needed.
+fn draw_too_small(f: &mut Frame, area: Rect, need: (u16, u16), th: &Theme) {
+    if area.width >= 3 && area.height >= 3 {
+        f.render_widget(
+            Block::default().borders(Borders::ALL).border_type(th.bt).border_style(Style::default().fg(th.border_focus)),
+            area,
+        );
+    }
+    let ok = |have: u16, need: u16| th.fg(if have >= need { th.green } else { th.red });
+    let dim = th.fg(th.sub);
+    let size = |w: u16, h: u16, wst: Style, hst: Style| {
+        Line::from(vec![
+            Span::styled("Width = ", dim),
+            Span::styled(w.to_string(), wst),
+            Span::styled(" Height = ", dim),
+            Span::styled(h.to_string(), hst),
+        ])
+        .centered()
+    };
+    let lines = vec![
+        Line::from(Span::styled("Terminal size too small:", th.bold(th.text))).centered(),
+        size(area.width, area.height, ok(area.width, need.0), ok(area.height, need.1)),
+        Line::from(""),
+        Line::from(Span::styled("Needed for current config:", th.bold(th.text))).centered(),
+        size(need.0, need.1, th.fg(th.text), th.fg(th.text)),
+    ];
+    let h = lines.len() as u16;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let inner = Rect::new(area.x, y, area.width, h.min(area.height.saturating_sub(y - area.y)));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_topbar(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
@@ -229,7 +293,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
     draw_sidebar(f, app, cols[0], th);
     draw_tracks(f, app, cols[1], th);
     // cover gets a share of the right column; the queue keeps at least 4 rows
-    let cover_h = ((area.height as u32 * l.cover_pct as u32 / 100) as u16).clamp(4.min(area.height), area.height.saturating_sub(4));
+    let cover_h = fit((area.height as u32 * l.cover_pct as u32 / 100) as u16, 4, area.height.saturating_sub(4));
     let side = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(cover_h), Constraint::Min(4)])
@@ -793,7 +857,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             );
         }
         Modal::Search(s) => {
-            let h = (s.rows.len() as u16 + 6).clamp(8, area.height.saturating_sub(4));
+            let h = fit(s.rows.len() as u16 + 6, 8, area.height.saturating_sub(4));
             let r = centered(area, 72, h);
             f.render_widget(Clear, r);
             overlays.push(r);
@@ -920,7 +984,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         }
         Modal::Picker(p) => {
             let vis = p.visible();
-            let h = (vis.len() as u16 + if p.query.is_some() { 5 } else { 4 }).clamp(6, area.height.saturating_sub(4));
+            let h = fit(vis.len() as u16 + if p.query.is_some() { 5 } else { 4 }, 6, area.height.saturating_sub(4));
             let r = centered(area, 54, h);
             f.render_widget(Clear, r);
             overlays.push(r);
@@ -1106,6 +1170,183 @@ mod tests {
             let last_glyph = row[..border].iter().rposition(|c| *c != ' ').unwrap();
             assert!(border - last_glyph >= 3, "{w} cols: only {} blank cells before the border", border - last_glyph - 1);
         }
+    }
+
+    /// Every screen the app can show, ready to be rendered at any size.
+    fn scenarios() -> Vec<(&'static str, App)> {
+        use crate::modal::{InputModal, InputPurpose, LyricsModal, Login, PickKind, Picker, SearchModal, TextField};
+        let mut v: Vec<(&'static str, App)> = Vec::new();
+        let mut add = |name, mode, f: &dyn Fn(&mut App)| {
+            let mut a = test_app(mode);
+            a.zen = false;
+            f(&mut a);
+            v.push((name, a));
+        };
+        add("normal", ArtMode::HalfCell, &|_| {});
+        add("normal+sixel", ArtMode::Sixel, &|_| {});
+        add("normal+square+toasts", ArtMode::HalfCell, &|a| {
+            a.square = true;
+            for i in 0..5 {
+                a.notify(format!("a fairly long toast message number {i}"), Level::Warn);
+            }
+        });
+        add("zen", ArtMode::HalfCell, &|a| a.zen = true);
+        add("zen+sixel", ArtMode::Sixel, &|a| a.zen = true);
+        add("help", ArtMode::HalfCell, &|a| a.modal = Some(Modal::Help { scroll: 3 }));
+        add("search", ArtMode::HalfCell, &|a| {
+            let mut s = SearchModal::default();
+            s.set_results(crate::models::SearchResults {
+                songs: (0..30).map(|i| Song { id: i.to_string(), title: format!("t{i}"), ..Default::default() }).collect(),
+                ..Default::default()
+            });
+            a.modal = Some(Modal::Search(s));
+        });
+        add("picker", ArtMode::HalfCell, &|a| {
+            let items = (0..60).map(|i| format!("item {i}")).collect();
+            a.modal = Some(Modal::Picker(Picker::new("pick", items, PickKind::Genre, true)));
+        });
+        add("input", ArtMode::HalfCell, &|a| {
+            a.modal = Some(Modal::Input(InputModal {
+                title: "new playlist".into(),
+                placeholder: "name".into(),
+                field: TextField::new("x"),
+                purpose: InputPurpose::SaveQueue,
+            }));
+        });
+        add("lyrics", ArtMode::HalfCell, &|a| {
+            a.modal = Some(Modal::Lyrics(LyricsModal { title: "t".into(), synced: Some(vec![(0.0, "a".into()); 50]), text: String::new(), scroll: 0 }));
+        });
+        add("stats", ArtMode::HalfCell, &|a| {
+            a.modal = Some(Modal::Stats { summary: crate::stats::summarize(&[], 0.0, 14), scroll: 0 });
+        });
+        add("login", ArtMode::HalfCell, &|a| a.modal = Some(Modal::Login(Login::new("", ""))));
+        v
+    }
+
+    #[test]
+    fn no_screen_panics_at_any_terminal_size() {
+        // Every screen × every size from 1×1 up past a big monitor. A terminal being dragged
+        // smaller walks through all of these, so a panic at *any* of them is a crash for a user.
+        // Exhaustive through and just past the minimum (64×16), where layouts are tightest and
+        // bugs live; sparse beyond it, where a full render is ~100× dearer than a "too small" one.
+        let widths: Vec<u16> = (1..=72).chain([80, 100, 120, 150, 200]).collect();
+        let heights: Vec<u16> = (1..=24).chain([30, 36, 42]).collect();
+        let mut failures = Vec::new();
+        for (name, mut app) in scenarios() {
+            for &w in &widths {
+                for &h in &heights {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                        t.draw(|f| draw(f, &mut app)).unwrap();
+                    }));
+                    if r.is_err() {
+                        failures.push(format!("{name} at {w}x{h}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "panicked at: {:?} (+{} more)", &failures[..failures.len().min(8)], failures.len().saturating_sub(8));
+    }
+
+    #[test]
+    fn layout_code_is_safe_below_the_minimum_size_even_without_the_guard() {
+        // The too-small screen *hides* these functions' behaviour at small sizes, so test
+        // them directly: the reported crash was `clamp(4, 2)` in draw_main on a 12-row terminal.
+        for h in 0..=24u16 {
+            for w in [0u16, 1, 10, 30, 64, 100] {
+                let mut app = test_app(ArtMode::HalfCell);
+                app.zen = false;
+                let th = app.theme();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut t = Terminal::new(TestBackend::new(w.max(1), h.max(1))).unwrap();
+                    t.draw(|f| {
+                        let a = Rect::new(0, 0, w, h);
+                        draw_main(f, &mut app, a, &th);
+                        draw_zen(f, &mut app, a, &th);
+                        draw_modal(f, &mut app, a, &th);
+                    })
+                    .unwrap();
+                }));
+                assert!(r.is_ok(), "draw_main/draw_zen/draw_modal panicked in a {w}x{h} area");
+            }
+        }
+        assert_eq!(fit(4, 4, 2), 2, "an inverted range must not panic");
+        assert_eq!(fit(0, 4, 100), 4);
+        assert_eq!(fit(500, 4, 100), 100);
+    }
+
+    #[test]
+    fn too_small_screen_reports_sizes_with_red_and_green() {
+        use ratatui::style::Color;
+        let colour_of = |t: &Terminal<TestBackend>, row: u16, needle: &str| -> Color {
+            let text = row_text(t, row);
+            let x = text.find(needle).unwrap_or_else(|| panic!("{needle:?} not on row {row}: {text}"));
+            let col = text[..x].chars().count() as u16;
+            t.backend().buffer().cell((col, row)).unwrap().fg
+        };
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let th = app.theme();
+
+        // both dimensions short: both red
+        let t = render(&mut app, 50, 12);
+        let row = find_row(&t, "Terminal size too small").expect("message");
+        assert!(row_text(&t, row + 1).contains("Width = 50 Height = 12"), "{}", row_text(&t, row + 1));
+        assert!(row_text(&t, row + 3).contains("Needed for current config"));
+        assert!(row_text(&t, row + 4).contains(&format!("Width = {} Height = {}", MIN_SIZE.0, MIN_SIZE.1)));
+        assert_eq!(colour_of(&t, row + 1, "50"), th.red);
+        assert_eq!(colour_of(&t, row + 1, "12"), th.red);
+
+        // wide enough, too short: width green, height red
+        let t = render(&mut app, 80, 12);
+        let row = find_row(&t, "Terminal size too small").unwrap();
+        assert_eq!(colour_of(&t, row + 1, "80"), th.green);
+        assert_eq!(colour_of(&t, row + 1, "12"), th.red);
+
+        // tall enough, too narrow: the other way round
+        let t = render(&mut app, 40, 30);
+        let row = find_row(&t, "Terminal size too small").unwrap();
+        assert_eq!(colour_of(&t, row + 1, "40"), th.red);
+        assert_eq!(colour_of(&t, row + 1, "30"), th.green);
+
+        // exactly the minimum is fine: the real UI, no message
+        let t = render(&mut app, MIN_SIZE.0, MIN_SIZE.1);
+        assert!(find_row(&t, "Terminal size too small").is_none());
+        assert!(find_row(&t, "library").is_some());
+        // one short in either direction is not
+        assert!(find_row(&render(&mut app, MIN_SIZE.0 - 1, MIN_SIZE.1), "too small").is_some());
+        assert!(find_row(&render(&mut app, MIN_SIZE.0, MIN_SIZE.1 - 1), "too small").is_some());
+    }
+
+    #[test]
+    fn zen_has_its_own_smaller_minimum() {
+        let mut app = test_app(ArtMode::HalfCell); // zen = true
+        let t = render(&mut app, 40, MIN_SIZE_ZEN.1 - 1);
+        let row = find_row(&t, "Terminal size too small").expect("zen message");
+        assert!(row_text(&t, row + 4).contains(&format!("Width = {} Height = {}", MIN_SIZE_ZEN.0, MIN_SIZE_ZEN.1)));
+        // a size that is too small for the normal layout but fine for zen shows zen
+        let t = render(&mut app, 40, MIN_SIZE_ZEN.1);
+        assert!(find_row(&t, "Terminal size too small").is_none());
+        assert!(find_row(&t, "Zen Title").is_some());
+    }
+
+    #[test]
+    fn too_small_screen_covers_modals_and_forgets_stale_hit_boxes() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.modal = Some(Modal::Help { scroll: 0 });
+        app.notify("a toast", Level::Info);
+        let _ = render(&mut app, 150, 42);
+        assert!(app.rects.tracks.width > 0 && !app.overlay_rects.is_empty());
+        let t = render(&mut app, 40, 10);
+        assert!(find_row(&t, "Terminal size too small").is_some());
+        assert!(find_row(&t, "a toast").is_none() && find_row(&t, "keys").is_none(), "nothing else is drawn");
+        assert_eq!(app.rects.tracks.width, 0, "a click can't land on a panel that isn't there");
+        assert!(app.overlay_rects.is_empty() && app.sixel.show.is_none() && app.sixel.want.is_none());
+        // …and the app is intact when the window grows back
+        let t = render(&mut app, 150, 42);
+        assert!(find_row(&t, "Terminal size too small").is_none());
+        assert!(matches!(app.modal, Some(Modal::Help { .. })), "the open modal survived");
     }
 
     #[test]

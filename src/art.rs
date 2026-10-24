@@ -134,7 +134,10 @@ impl Art {
             return;
         }
         // pixel budget: one px per column, two per row
-        let side = (area.width as u32).min(area.height as u32 * 2).max(2) & !1;
+        let side = (area.width as u32).min(area.height as u32 * 2) & !1;
+        if side < 2 {
+            return; // not even one whole cell of picture fits
+        }
         let mut cols = side as u16;
         let mut rows = (side / 2) as u16;
         if (area.width - cols) % 2 == 1 && cols < area.width {
@@ -183,6 +186,24 @@ mod tests {
         }
         let Some(Color::Rgb(r, g, b)) = extract_vibrant(&img) else { panic!("no color") };
         assert!(r > 150 && g < 100 && b < 120, "got {r},{g},{b}");
+    }
+
+    #[test]
+    fn rendering_into_slivers_never_panics_or_overflows_the_area() {
+        let art = Art::new(RgbImage::from_pixel(64, 64, Rgb([9, 9, 9])));
+        for w in 0..=6u16 {
+            for h in 0..=6u16 {
+                let area = Rect::new(3, 2, w, h);
+                let mut buf = Buffer::empty(Rect::new(0, 0, 20, 20));
+                art.render(area, &mut buf); // must not panic (was: u16 underflow when w < 2)
+                for y in 0..20u16 {
+                    for x in 0..20u16 {
+                        let inside = x >= area.x && x < area.x + w && y >= area.y && y < area.y + h;
+                        assert!(inside || buf.cell((x, y)).unwrap().symbol() == " ", "{w}x{h}: wrote outside the area at ({x},{y})");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
