@@ -49,9 +49,11 @@ try:
     t.close()
 
     t = play(h, cols=100, rows=36)       # narrow: the help modal overlaps the cover
-    n = len(sixel_blobs(t.raw)); t.send("?", 1.0)
+    n = len(sixel_blobs(t.raw)); c0 = t.raw.count(b"\x1b[2J"); t.send("?", 1.0)
     check("an overlapping modal suppresses the image", len(sixel_blobs(t.raw)) == n)
+    check("…without blanking the whole screen to do it", t.raw.count(b"\x1b[2J") == c0)
     check("closing the modal restores it", delta(t, KEYS["ESC"]) == 1)
+    check("…and without a full-screen clear either", t.raw.count(b"\x1b[2J") == c0)
     check("changing theme re-sends it", delta(t, "t") == 1)
     check("changing track re-sends it", delta(t, "n", 2.5) == 1)
     check("a toast does not touch it", delta(t, "f", 1.0) == 0)

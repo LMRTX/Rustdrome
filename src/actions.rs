@@ -67,6 +67,7 @@ pub const COMMANDS: &[(&str, Action)] = &[
     ("refresh", Action::Refresh),
     ("cycle theme", Action::ThemeCycle),
     ("pick theme", Action::ThemePick),
+    ("square / rounded boxes", Action::BorderStyle),
     ("zen splash", Action::Zen),
     ("help", Action::Help),
     ("quit", Action::Quit),
@@ -296,6 +297,11 @@ impl App {
                 let mut p = Picker::new("theme", items, PickKind::Theme { original: self.theme_name.clone() }, false);
                 p.cursor = theme::THEMES.iter().position(|t| t.name == self.theme_name).unwrap_or(0);
                 self.modal = Some(Modal::Picker(p));
+            }
+            BorderStyle => {
+                self.square = !self.square;
+                self.dirs.save_state(serde_json::json!({ "border_style": if self.square { "square" } else { "rounded" } }));
+                self.info(if self.square { "square boxes" } else { "rounded boxes" });
             }
             Zen => self.zen = !self.zen,
             PrivateMode => {

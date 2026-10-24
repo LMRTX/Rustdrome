@@ -1,6 +1,6 @@
 [package]
 name = "rustdrome"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.84"
 description = "A fast, animated terminal player for Navidrome — Rust + ratatui, with sixel cover art"

@@ -107,7 +107,7 @@ pub enum Msg {
     Genres(Vec<Genre>),
     Bookmarks(Vec<Bookmark>),
     Art { cover_id: String, path: std::path::PathBuf, small: image::RgbImage },
-    Sixel { cover: String, side: u32, enc: Option<crate::sixel::Encoded> },
+    Sixel { cover: String, key: crate::sixel::PlanKey, enc: Option<crate::sixel::Encoded> },
     Share(String),
     DlProgress { failed: bool },
     DlDone { label: String },
@@ -121,6 +121,86 @@ pub enum Msg {
     Pinned,
 }
 
+/// A draggable boundary between panels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Divider {
+    /// library | tracks
+    Sidebar,
+    /// tracks | cover+queue
+    Side,
+    /// cover / queue
+    Cover,
+}
+
+/// User-adjustable panel sizes (remembered in `state.json`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PanelLayout {
+    /// library column width, cells
+    pub sidebar: u16,
+    /// cover+queue column width, cells
+    pub side: u16,
+    /// share of the right column given to the cover, percent
+    pub cover_pct: u16,
+}
+
+impl Default for PanelLayout {
+    fn default() -> Self {
+        Self { sidebar: 26, side: 36, cover_pct: 40 }
+    }
+}
+
+impl PanelLayout {
+    pub const MIN_SIDEBAR: u16 = 14;
+    pub const MAX_SIDEBAR: u16 = 50;
+    pub const MIN_SIDE: u16 = 24;
+    pub const MAX_SIDE: u16 = 80;
+    pub const MIN_TRACKS: u16 = 24;
+    pub const MIN_COVER: u16 = 15;
+    pub const MAX_COVER: u16 = 80;
+
+    /// Keep every panel usable for a given total width: the tracks list always
+    /// keeps `MIN_TRACKS`, taking from the right column first, then the left.
+    pub fn clamped(self, total: u16) -> Self {
+        let mut sidebar = self.sidebar.clamp(Self::MIN_SIDEBAR, Self::MAX_SIDEBAR);
+        let mut side = self.side.clamp(Self::MIN_SIDE, Self::MAX_SIDE);
+        let over = (sidebar + side + Self::MIN_TRACKS).saturating_sub(total);
+        let take = over.min(side - Self::MIN_SIDE);
+        side -= take;
+        sidebar -= (over - take).min(sidebar - Self::MIN_SIDEBAR);
+        Self { sidebar, side, cover_pct: self.cover_pct.clamp(Self::MIN_COVER, Self::MAX_COVER) }
+    }
+
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({ "sidebar": self.sidebar, "side": self.side, "cover_pct": self.cover_pct })
+    }
+
+    pub fn from_json(v: Option<&serde_json::Value>) -> Self {
+        let d = Self::default();
+        let get = |k: &str, def: u16| {
+            v.and_then(|v| v.get(k)).and_then(|n| n.as_u64()).map_or(def, |n| n.min(u16::MAX as u64) as u16)
+        };
+        Self { sidebar: get("sidebar", d.sidebar), side: get("side", d.side), cover_pct: get("cover_pct", d.cover_pct) }
+    }
+
+    /// The layout after dragging `d` so its boundary sits at screen
+    /// position `(x, y)`. `main` is the area the panels fill; `side_col` is the
+    /// right-hand column (for the cover/queue split).
+    pub fn dragged(self, d: Divider, x: u16, y: u16, main: Rect, side_col: Rect) -> Self {
+        let mut l = self;
+        match d {
+            // the boundary column becomes the sidebar's last column
+            Divider::Sidebar => l.sidebar = (x + 1).saturating_sub(main.x),
+            // the boundary column becomes the right column's first column
+            Divider::Side => l.side = (main.x + main.width).saturating_sub(x),
+            Divider::Cover => {
+                let h = (y + 1).saturating_sub(side_col.y) as u32;
+                l.cover_pct = (h * 100 / side_col.height.max(1) as u32).min(100) as u16;
+            }
+        }
+        l.clamped(main.width)
+    }
+}
+
 /// Screen regions from the last draw, for mouse hit-testing.
 #[derive(Default, Clone, Copy)]
 pub struct Rects {
@@ -131,6 +211,13 @@ pub struct Rects {
     pub gauge: Rect,    // volume gauge
     pub shuffle: Rect,
     pub repeat: Rect,
+    /// grab zones for the draggable boundaries
+    pub div_sidebar: Rect,
+    pub div_side: Rect,
+    pub div_cover: Rect,
+    /// the area the three columns fill, and the right-hand column
+    pub main: Rect,
+    pub side_col: Rect,
 }
 
 pub struct App {
@@ -142,6 +229,8 @@ pub struct App {
 
     // look
     pub theme_name: String,
+    /// square (plain) box corners instead of rounded
+    pub square: bool,
     pub tint: Option<Color>,
     pub tick: usize,
     pub logo_phase: f64,
@@ -151,6 +240,13 @@ pub struct App {
     pub speed_flash: u32,
     pub toasts: Vec<Toast>,
     pub rects: Rects,
+    pub layout: PanelLayout,
+    pub drag: Option<Divider>,
+    pub last_div_click: Option<(Instant, Divider)>,
+    /// cell-size tracking (see `App::maintain_cell_size`)
+    pub cell_probe_ok: bool,
+    pub resize_at: Option<Instant>,
+    pub win_sig: Option<(u16, u16, u16, u16)>,
 
     // engine
     pub player: Player,
@@ -270,6 +366,10 @@ impl App {
             client: None,
             tx,
             theme_name,
+            square: match state.get("border_style").and_then(|v| v.as_str()) {
+                Some(s) => s == "square",
+                None => settings.border_style == "square",
+            },
             tint: None,
             tick: 0,
             logo_phase: 0.0,
@@ -279,6 +379,12 @@ impl App {
             speed_flash: 0,
             toasts: vec![],
             rects: Rects::default(),
+            layout: PanelLayout::from_json(state.get("ui_layout")),
+            drag: None,
+            last_div_click: None,
+            cell_probe_ok: false,
+            resize_at: None,
+            win_sig: None,
             player: Player::null(),
             queue,
             now_song,
@@ -346,7 +452,7 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        theme::by_name(&self.theme_name).tinted(self.tint)
+        theme::by_name(&self.theme_name).tinted(self.tint).with_square(self.square)
     }
 
     pub fn spawn<F: Future<Output = ()> + Send + 'static>(&self, f: F) {
@@ -499,7 +605,7 @@ impl App {
                     crate::mem::trim();
                 }
             }
-            Msg::Sixel { cover, side, enc } => self.on_sixel(cover, side, enc),
+            Msg::Sixel { cover, key, enc } => self.on_sixel(cover, key, enc),
             Msg::Share(url) => {
                 crate::clipboard::copy(&url);
                 self.info(format!("share link copied: {url}"));
@@ -723,8 +829,42 @@ impl App {
                     }
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(d) = self.drag {
+                    let r = self.rects;
+                    self.layout = self.layout.dragged(d, x, y, r.main, r.side_col);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    self.dirs.save_state(serde_json::json!({ "ui_layout": self.layout.to_json() }));
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let r = self.rects;
+                let div = [(r.div_sidebar, Divider::Sidebar), (r.div_side, Divider::Side), (r.div_cover, Divider::Cover)]
+                    .into_iter()
+                    .find(|(z, _)| !self.zen && z.width > 0 && z.height > 0 && hit(*z))
+                    .map(|(_, d)| d);
+                if let Some(d) = div {
+                    // double-click a boundary to put it back to its default
+                    let double = self
+                        .last_div_click
+                        .is_some_and(|(t, pd)| pd == d && t.elapsed() < Duration::from_millis(400));
+                    self.last_div_click = Some((Instant::now(), d));
+                    if double {
+                        let def = PanelLayout::default();
+                        match d {
+                            Divider::Sidebar => self.layout.sidebar = def.sidebar,
+                            Divider::Side => self.layout.side = def.side,
+                            Divider::Cover => self.layout.cover_pct = def.cover_pct,
+                        }
+                        self.dirs.save_state(serde_json::json!({ "ui_layout": self.layout.to_json() }));
+                    } else {
+                        self.drag = Some(d);
+                    }
+                    return;
+                }
                 if hit(r.bar) && r.bar.width > 0 {
                     self.seek_fraction((x - r.bar.x) as f64 / r.bar.width as f64 + 0.5 / r.bar.width as f64);
                 } else if hit(r.gauge) && r.gauge.width > 0 {
@@ -981,5 +1121,71 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn main_area() -> (Rect, Rect) {
+        let main = Rect::new(0, 1, 150, 36);
+        (main, Rect::new(114, 1, 36, 36))
+    }
+
+    #[test]
+    fn clamp_always_leaves_the_tracks_list_usable() {
+        for total in [60u16, 80, 100, 150, 250] {
+            for sidebar in [0u16, 14, 26, 50, 200] {
+                for side in [0u16, 24, 36, 80, 200] {
+                    let l = PanelLayout { sidebar, side, cover_pct: 40 }.clamped(total);
+                    assert!((PanelLayout::MIN_SIDEBAR..=PanelLayout::MAX_SIDEBAR).contains(&l.sidebar));
+                    assert!((PanelLayout::MIN_SIDE..=PanelLayout::MAX_SIDE).contains(&l.side));
+                    // below the hard minimums nothing more can give; above them tracks must keep its room
+                    if total >= PanelLayout::MIN_SIDEBAR + PanelLayout::MIN_SIDE + PanelLayout::MIN_TRACKS {
+                        assert!(l.sidebar + l.side + PanelLayout::MIN_TRACKS <= total, "{total} {sidebar} {side} -> {l:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_each_divider_moves_exactly_that_panel() {
+        let (main, side_col) = main_area();
+        let d = PanelLayout::default();
+        // library|tracks: the boundary column becomes the sidebar's last column
+        let l = d.dragged(Divider::Sidebar, 39, 10, main, side_col);
+        assert_eq!((l.sidebar, l.side, l.cover_pct), (40, d.side, d.cover_pct));
+        // tracks|side: dragging left widens the right column
+        let l = d.dragged(Divider::Side, 100, 10, main, side_col);
+        assert_eq!((l.sidebar, l.side), (d.sidebar, 50));
+        // cover/queue: a border half-way down the column → ~50%
+        let l = d.dragged(Divider::Cover, 120, 1 + 18 - 1, main, side_col);
+        assert_eq!(l.cover_pct, 50);
+        assert_eq!((l.sidebar, l.side), (d.sidebar, d.side));
+    }
+
+    #[test]
+    fn dragging_past_the_edges_is_clamped_not_broken() {
+        let (main, side_col) = main_area();
+        let d = PanelLayout::default();
+        assert_eq!(d.dragged(Divider::Sidebar, 0, 5, main, side_col).sidebar, PanelLayout::MIN_SIDEBAR);
+        assert_eq!(d.dragged(Divider::Sidebar, 149, 5, main, side_col).sidebar, PanelLayout::MAX_SIDEBAR);
+        assert_eq!(d.dragged(Divider::Side, 0, 5, main, side_col).side, PanelLayout::MAX_SIDE.min(150 - d.sidebar - PanelLayout::MIN_TRACKS));
+        assert_eq!(d.dragged(Divider::Side, 149, 5, main, side_col).side, PanelLayout::MIN_SIDE);
+        assert_eq!(d.dragged(Divider::Cover, 120, 0, main, side_col).cover_pct, PanelLayout::MIN_COVER);
+        assert_eq!(d.dragged(Divider::Cover, 120, 999, main, side_col).cover_pct, PanelLayout::MAX_COVER);
+    }
+
+    #[test]
+    fn layout_persists_and_survives_garbage() {
+        let l = PanelLayout { sidebar: 31, side: 44, cover_pct: 55 };
+        assert_eq!(PanelLayout::from_json(Some(&l.to_json())), l);
+        assert_eq!(PanelLayout::from_json(None), PanelLayout::default());
+        let junk = serde_json::json!({ "sidebar": "wide", "side": -3, "cover_pct": 1e9 });
+        let g = PanelLayout::from_json(Some(&junk)).clamped(150);
+        assert!((PanelLayout::MIN_SIDEBAR..=PanelLayout::MAX_SIDEBAR).contains(&g.sidebar));
+        assert!(g.cover_pct <= PanelLayout::MAX_COVER);
     }
 }

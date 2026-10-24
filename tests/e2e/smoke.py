@@ -27,7 +27,9 @@ try:
     open(LOG, "w").close()
     t = Term(home)
     has = lambda s: any(s in l for l in t.text().split("\n"))
-    t.pump(2.0)
+    for _ in range(40):                      # a cold machine can take seconds; don't race it
+        t.pump(0.25)
+        if has("connect to your navidrome"): break
     check("first run shows the login form", has("connect to your navidrome"))
     t.send("http://127.0.0.1:4599"); t.send(KEYS["TAB"]); t.send("demo"); t.send(KEYS["TAB"]); t.send("wrong")
     t.send(KEYS["ENTER"], 1.5)

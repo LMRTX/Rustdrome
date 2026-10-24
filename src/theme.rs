@@ -6,6 +6,7 @@
 //! so gradients and shimmers degrade to flat colors there (`ansi == true`).
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::BorderType;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -30,6 +31,8 @@ pub struct Theme {
     pub border_alt: Color,
     pub modal_bg: Color,
     pub cursor: Color,
+    /// `Rounded` (default) or `Plain` (square corners) — every box uses this
+    pub bt: BorderType,
 }
 
 /// `(r, g, b)` if the color is a truecolor value.
@@ -72,6 +75,7 @@ const MOCHA: Theme = Theme {
     border_alt: Color::Rgb(0xb4, 0xbe, 0xfe),
     modal_bg: Color::Rgb(0x18, 0x18, 0x25),
     cursor: Color::Rgb(0x3e, 0x48, 0x69),
+    bt: BorderType::Rounded,
 };
 
 const VOID: Theme = Theme {
@@ -136,6 +140,7 @@ const SYSTEM: Theme = Theme {
     border_alt: Color::LightBlue,
     modal_bg: Color::Black,
     cursor: Color::DarkGray,
+    bt: BorderType::Rounded,
 };
 
 pub const THEMES: [Theme; 5] = [MOCHA, VOID, ONYX, CLEAR, SYSTEM];
@@ -159,6 +164,12 @@ impl Theme {
             self.lav = blend(self.lav, t, 0.50);
             self.mauve = blend(self.mauve, t, 0.45);
         }
+        self
+    }
+
+    /// Square corners instead of rounded ones.
+    pub fn with_square(mut self, square: bool) -> Self {
+        self.bt = if square { BorderType::Plain } else { BorderType::Rounded };
         self
     }
 
@@ -197,6 +208,17 @@ mod tests {
         assert_eq!(t.blue, sys.blue);
         let mocha = by_name("mocha").tinted(Some(Color::Rgb(255, 0, 0)));
         assert_ne!(mocha.blue, by_name("mocha").blue);
+    }
+
+    #[test]
+    fn square_mode_changes_only_the_border_type() {
+        let r = by_name("mocha");
+        let q = r.with_square(true);
+        assert_eq!(q.bt, BorderType::Plain);
+        assert_eq!(r.bt, BorderType::Rounded);
+        assert_eq!((q.blue, q.bg, q.text), (r.blue, r.bg, r.text), "colours untouched");
+        assert_eq!(q.with_square(false).bt, BorderType::Rounded);
+        assert!(THEMES.iter().all(|t| t.bt == BorderType::Rounded), "rounded is the default everywhere");
     }
 
     #[test]

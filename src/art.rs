@@ -109,7 +109,7 @@ pub fn extract_vibrant(img: &RgbImage) -> Option<Color> {
 /// 8fps heartbeat doesn't resample every frame.
 pub struct Art {
     src: RgbImage,
-    scaled: RefCell<Option<(u32, RgbImage)>>,
+    scaled: RefCell<Option<(u32, RgbImage)>>, // keyed by (width_px << 16 | height_px)
 }
 
 impl Art {
@@ -122,21 +122,34 @@ impl Art {
     }
 
     /// Draw the cover centered in `area`, as large as fits while staying
-    /// square (a cell is ~1:2, so a square image is `w` cells × `w/2` rows).
+    /// (nearly) square — a cell is ~1:2, so a square image is `w` cells ×
+    /// `w/2` rows.
+    ///
+    /// The image is sized to a whole number of cells whose *parity matches the
+    /// area's*, so the gap on the left equals the gap on the right (and top
+    /// equals bottom) instead of differing by half a cell. That costs at most
+    /// one pixel of aspect ratio.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         // pixel budget: one px per column, two per row
-        let side = (area.width as u32).min(area.height as u32 * 2).max(2);
-        let side = side & !1; // even, so rows split cleanly
+        let side = (area.width as u32).min(area.height as u32 * 2).max(2) & !1;
+        let mut cols = side as u16;
+        let mut rows = (side / 2) as u16;
+        if (area.width - cols) % 2 == 1 && cols < area.width {
+            cols += 1;
+        }
+        if (area.height - rows) % 2 == 1 && rows < area.height {
+            rows += 1;
+        }
+        let (pw, ph) = (cols as u32, rows as u32 * 2);
+        let key = pw << 16 | ph;
         let mut cache = self.scaled.borrow_mut();
-        if cache.as_ref().map(|(s, _)| *s) != Some(side) {
-            *cache = Some((side, image::imageops::resize(&self.src, side, side, FilterType::Triangle)));
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+            *cache = Some((key, image::imageops::resize(&self.src, pw, ph, FilterType::Triangle)));
         }
         let img = &cache.as_ref().expect("just filled").1;
-        let cols = side as u16;
-        let rows = (side / 2) as u16;
         let x0 = area.x + (area.width - cols) / 2;
         let y0 = area.y + (area.height - rows) / 2;
         for cy in 0..rows {

@@ -4,7 +4,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -99,6 +99,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "app",
         &[
             ("t", "cycle themes"),
+            ("B", "square / rounded boxes"),
             ("T", "theme picker (live preview)"),
             ("N", "toggle notifications"),
             ("ctrl+y", "private listening"),
@@ -115,7 +116,7 @@ fn panel<'a>(title: &str, subtitle: Option<String>, focused: bool, th: &Theme) -
     let color = if focused { th.border_focus } else { th.border };
     let mut b = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(th.bt)
         .border_style(Style::default().fg(color))
         .title(Span::styled(format!(" {title} "), Style::default().fg(if focused { th.lav } else { th.dim })));
     if let Some(s) = subtitle {
@@ -220,18 +221,42 @@ fn draw_topbar(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
 }
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
+    let l = app.layout.clamped(area.width);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(20), Constraint::Length(36)])
+        .constraints([Constraint::Length(l.sidebar), Constraint::Min(10), Constraint::Length(l.side)])
         .split(area);
     draw_sidebar(f, app, cols[0], th);
     draw_tracks(f, app, cols[1], th);
+    // cover gets a share of the right column; the queue keeps at least 4 rows
+    let cover_h = ((area.height as u32 * l.cover_pct as u32 / 100) as u16).clamp(4.min(area.height), area.height.saturating_sub(4));
     let side = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Min(4)])
+        .constraints([Constraint::Length(cover_h), Constraint::Min(4)])
         .split(cols[2]);
     draw_art(f, app, side[0], th, true);
     draw_queue(f, app, side[1], th);
+
+    // grab zones: the two border columns (or rows) either side of a boundary
+    app.rects.main = area;
+    app.rects.side_col = cols[2];
+    app.rects.div_sidebar = Rect::new(cols[0].x + cols[0].width.saturating_sub(1), area.y, 2, area.height);
+    app.rects.div_side = Rect::new(cols[1].x + cols[1].width.saturating_sub(1), area.y, 2, area.height);
+    app.rects.div_cover = Rect::new(cols[2].x, side[0].y + side[0].height.saturating_sub(1), cols[2].width, 2);
+    if let Some(d) = app.drag {
+        let zone = match d {
+            Divider::Sidebar => app.rects.div_sidebar,
+            Divider::Side => app.rects.div_side,
+            Divider::Cover => app.rects.div_cover,
+        };
+        for y in zone.y..zone.y + zone.height {
+            for x in zone.x..zone.x + zone.width {
+                if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+                    c.set_fg(th.mauve);
+                }
+            }
+        }
+    }
 }
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
@@ -362,15 +387,17 @@ fn draw_art(f: &mut Frame, app: &mut App, area: Rect, th: &Theme, bordered: bool
         // blank — drawing glyphs under a bitmap would fight with it.
         let cover = app.now_song.as_ref().and_then(|s| s.cover_art.clone());
         let ready = matches!((&app.art, &cover), (Some((id, _)), Some(c)) if id == c);
-        if let (true, Some(cover)) = (ready, cover) {
-            if let Some(side) = crate::sixel::side_for(inner, app.cell_px) {
-                app.sixel.want = Some((cover.clone(), side, inner));
-                if let Some((c, s, enc)) = &app.sixel.cache {
-                    if *c == cover && *s == side {
+        // while the layout is still changing (divider drag, zoom, window resize)
+        // show nothing until it settles, then encode once at the right size
+        if let (true, Some(cover), false) = (ready, cover, app.settling()) {
+            if let Some(plan) = crate::sixel::plan(inner, app.cell_px) {
+                app.sixel.want = Some((cover.clone(), plan));
+                if let Some((c, k, _)) = &app.sixel.cache {
+                    if *c == cover && *k == plan.key {
                         app.sixel.show = Some(crate::sixel::Shown {
-                            rect: crate::sixel::cells_for(inner, app.cell_px, enc.width, enc.height),
+                            rect: plan.rect,
                             cover,
-                            side,
+                            key: plan.key,
                             theme: app.theme_name.clone(),
                             area: inner,
                         });
@@ -442,7 +469,7 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
     let border = if playing { th.border_alt } else { th.border };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(th.bt)
         .border_style(Style::default().fg(border))
         .title(Span::styled(" now playing ", th.fg(th.dim)));
     let inner = block.inner(area);
@@ -523,7 +550,10 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         right.push(Span::styled("¹", th.fg(th.peach)));
     }
     let rep_end: usize = right.iter().map(|s| s.content.width()).sum();
-    let right_w = rep_end;
+    // Nerd-font glyphs are width 1 to us but often draw wider; without a gap
+    // after the last one it bleeds into the box's right border.
+    right.push(Span::raw("  "));
+    let right_w = rep_end + 2;
 
     let bar_w = width.saturating_sub(times.width() + right_w).max(4);
     let frac = if dur > 0.0 { pos / dur } else { 0.0 };
@@ -544,33 +574,65 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
     let _ = gauge_end;
 }
 
-fn draw_zen(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(2), Constraint::Length(5)])
-        .split(area);
-    let w = (v[0].width.min(v[0].height * 2 + 4)).min(72);
-    let art_area = Rect::new(v[0].x + (v[0].width.saturating_sub(w)) / 2, v[0].y, w, v[0].height);
-    draw_art(f, app, art_area, th, false);
+/// Rows of text under the cover in zen mode: a blank line, the title, the
+/// album line, a blank line, and a five-line lyrics window.
+const ZEN_TEXT_ROWS: u16 = 9;
 
+/// How many rows the zen cover occupies: the biggest square that fits the
+/// width and what's left after the text, in rows. Knowing this up front lets
+/// the whole composition (cover + text) be centred as one group.
+pub fn zen_art_rows(width: u16, avail: u16, cell: (u16, u16), mode: crate::art::ArtMode) -> u16 {
+    if avail == 0 || width == 0 {
+        return 0;
+    }
+    match mode {
+        crate::art::ArtMode::Sixel => {
+            let (cw, ch) = (cell.0.max(1) as u32, cell.1.max(1) as u32);
+            let side = (width as u32 * cw).min(avail as u32 * ch).min(crate::sixel::MAX_SIDE);
+            (side.div_ceil(ch) as u16).clamp(1, avail)
+        }
+        // half-cells: one pixel per column, two per row
+        _ => (width.min(avail * 2) / 2).clamp(1, avail),
+    }
+}
+
+fn draw_zen(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
+    let avail = area.height.saturating_sub(ZEN_TEXT_ROWS);
+    let art_rows = zen_art_rows(area.width, avail, app.cell_px, app.art_mode);
+    // centre the cover and its text together, not the cover with text stuck to the bottom
+    let group = art_rows + ZEN_TEXT_ROWS.min(area.height);
+    let top = area.y + area.height.saturating_sub(group) / 2;
+
+    let art_box = Rect::new(area.x, top, area.width, art_rows);
+    draw_art(f, app, art_box, th, false);
+
+    let info_y = top + art_rows + 1; // one empty line under the cover
+    let lyrics_y = info_y + 2 + 1; //   and one between the album line and the lyrics
+    let bottom = area.y + area.height;
+    let line_w = area.width.saturating_sub(2) as usize;
     if let Some(s) = &app.now_song {
-        let lines = vec![
-            Line::from(Span::styled(s.title.clone(), th.bold(th.text))).centered(),
-            Line::from(Span::styled(format!("{} · {}", s.artist, s.album), th.fg(th.dim))).centered(),
-        ];
-        f.render_widget(Paragraph::new(lines), v[1]);
+        if info_y + 2 <= bottom {
+            let lines = vec![
+                Line::from(Span::styled(anim::ellipsize(&s.title, line_w), th.bold(th.text))).centered(),
+                Line::from(Span::styled(anim::ellipsize(&format!("{} · {}", s.artist, s.album), line_w), th.fg(th.dim))).centered(),
+            ];
+            f.render_widget(Paragraph::new(lines), Rect::new(area.x, info_y, area.width, 2));
+        }
     }
     if let Some((_, lines)) = &app.zen_lyrics {
-        let pos = app.now_position;
-        let cur = lines.iter().rposition(|(t, _)| *t <= pos);
-        let mut out = vec![];
-        for off in -2i64..=2 {
-            let idx = cur.map(|c| c as i64 + off);
-            let text = idx.and_then(|i| usize::try_from(i).ok()).and_then(|i| lines.get(i)).map_or("", |(_, t)| t.as_str());
-            let style = if off == 0 { th.bold(th.text) } else { th.fg(if off.abs() == 1 { th.dim } else { th.vfaint }) };
-            out.push(Line::from(Span::styled(text.to_string(), style)).centered());
+        if lyrics_y < bottom {
+            let pos = app.now_position;
+            let cur = lines.iter().rposition(|(t, _)| *t <= pos);
+            let mut out = vec![];
+            for off in -2i64..=2 {
+                let idx = cur.map(|c| c as i64 + off);
+                let text = idx.and_then(|i| usize::try_from(i).ok()).and_then(|i| lines.get(i)).map_or("", |(_, t)| t.as_str());
+                let style = if off == 0 { th.bold(th.text) } else { th.fg(if off.abs() == 1 { th.dim } else { th.vfaint }) };
+                out.push(Line::from(Span::styled(anim::ellipsize(text, line_w), style)).centered());
+            }
+            let h = 5.min(bottom - lyrics_y);
+            f.render_widget(Paragraph::new(out), Rect::new(area.x, lyrics_y, area.width, h));
         }
-        f.render_widget(Paragraph::new(out), v[2]);
     }
 }
 
@@ -630,7 +692,7 @@ fn draw_toasts(f: &mut Frame, app: &App, area: Rect, th: &Theme) -> Vec<Rect> {
         f.render_widget(Clear, r);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(th.bt)
             .border_style(Style::default().fg(color))
             .style(Style::default().bg(th.modal_bg));
         let inner = block.inner(r);
@@ -654,7 +716,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn modal_block<'a>(title: &str, th: &Theme) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(th.bt)
         .border_style(Style::default().fg(th.border_focus))
         .style(Style::default().bg(th.modal_bg).fg(th.text))
         .title(Span::styled(format!(" {title} "), th.bold(th.sub)))
@@ -881,4 +943,191 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         }
     }
     app.overlay_rects.extend(overlays);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::art::{Art, ArtMode};
+    use crate::config::{AppDirs, Settings};
+    use crate::models::Song;
+    use image::{Rgb, RgbImage};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn test_app(mode: ArtMode) -> App {
+        let tmp = std::env::temp_dir().join(format!("rustdrome-ui-{}", std::process::id()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(AppDirs::under(&tmp), Settings::default(), tx);
+        app.zen = true;
+        app.art_mode = mode;
+        app.now_song = Some(Song {
+            id: "s".into(),
+            title: "Zen Title".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            cover_art: Some("c1".into()),
+            ..Default::default()
+        });
+        app.art = Some(("c1".into(), Art::new(RgbImage::from_pixel(64, 64, Rgb([200, 80, 40])))));
+        // six lyric lines, positioned on line 2 so the whole five-line window is populated
+        app.zen_lyrics = Some(("s".into(), (0..6).map(|i| (i as f64 * 5.0, format!("L{i}"))).collect()));
+        app.now_position = 10.5;
+        app
+    }
+
+    fn render(app: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        t
+    }
+
+    fn row_text(t: &Terminal<TestBackend>, y: u16) -> String {
+        let b = t.backend().buffer();
+        (0..b.area.width).map(|x| b.cell((x, y)).unwrap().symbol().to_string()).collect()
+    }
+
+    fn find_row(t: &Terminal<TestBackend>, needle: &str) -> Option<u16> {
+        (0..t.backend().buffer().area.height).find(|&y| row_text(t, y).contains(needle))
+    }
+
+    /// leading/trailing blank cells of a row
+    fn gaps(row: &str) -> (usize, usize) {
+        let chars: Vec<char> = row.chars().collect();
+        let first = chars.iter().position(|c| *c != ' ').unwrap_or(chars.len());
+        let last = chars.iter().rposition(|c| *c != ' ').unwrap_or(0);
+        (first, chars.len() - 1 - last)
+    }
+
+    #[test]
+    fn zen_text_has_the_blank_lines_and_the_cover_is_symmetric_at_every_size() {
+        for w in [60u16, 61, 80, 99, 100, 101, 120, 121, 150, 151, 200] {
+            for h in [24u16, 25, 30, 31, 36, 42, 43] {
+                let mut app = test_app(ArtMode::HalfCell);
+                let t = render(&mut app, w, h);
+                let ctx = format!("{w}x{h}");
+
+                let art_rows: Vec<u16> = (0..h).filter(|&y| row_text(&t, y).contains('▀')).collect();
+                assert!(!art_rows.is_empty(), "{ctx}: no cover drawn");
+                let (first_art, last_art) = (art_rows[0], *art_rows.last().unwrap());
+                let title = find_row(&t, "Zen Title").unwrap_or_else(|| panic!("{ctx}: no title"));
+                let album = find_row(&t, "Artist · Album").unwrap_or_else(|| panic!("{ctx}: no album line"));
+
+                // one empty line under the cover, album directly under the title
+                assert_eq!(title, last_art + 2, "{ctx}: exactly one blank row between cover and title");
+                assert!(row_text(&t, last_art + 1).trim().is_empty(), "{ctx}: that row is blank");
+                assert_eq!(album, title + 1, "{ctx}");
+                // one empty line between the album line and the lyrics
+                assert!(row_text(&t, album + 1).trim().is_empty(), "{ctx}: blank row under album");
+                assert!(row_text(&t, album + 2).contains("L0"), "{ctx}: lyrics start right after the blank row");
+
+                // the cover is centred to the cell: equal gaps left and right
+                for &y in &art_rows {
+                    let (l, r) = gaps(&row_text(&t, y));
+                    assert_eq!(l, r, "{ctx}: cover not centred on row {y} (left {l}, right {r})");
+                }
+                // text is centred too (a centred string of odd/even width can be half a cell off)
+                for y in [title, album] {
+                    let (l, r) = gaps(&row_text(&t, y));
+                    assert!(l.abs_diff(r) <= 1, "{ctx}: row {y} gaps {l}/{r}");
+                }
+                // the whole group (cover + 9 text rows) is centred in the zen area
+                let area_top = 1u16;
+                let area_bottom = h - 4 - 1;
+                let group_end = album + 2 + 5; // lyrics window is five rows
+                let (top_gap, bottom_gap) = (first_art - area_top, area_bottom.saturating_sub(group_end));
+                assert!(top_gap.abs_diff(bottom_gap) <= 1, "{ctx}: group off-centre vertically ({top_gap} above, {bottom_gap} below)");
+            }
+        }
+    }
+
+    #[test]
+    fn zen_sixel_canvas_is_exactly_centred_for_many_cell_sizes() {
+        for cell in [(10u16, 20u16), (9, 18), (14, 28), (7, 15), (8, 16), (13, 31)] {
+            for w in [80u16, 81, 120, 121, 160, 161] {
+                for h in [26u16, 27, 36, 37, 46] {
+                    let mut app = test_app(ArtMode::Sixel);
+                    app.cell_px = cell;
+                    let _ = render(&mut app, w, h);
+                    let (_, plan) = app.sixel.want.clone().unwrap_or_else(|| panic!("{cell:?} {w}x{h}: no plan"));
+                    let r = plan.rect;
+                    let ctx = format!("cell {cell:?} {w}x{h} rect {r:?}");
+                    assert_eq!(r.x, w - (r.x + r.width), "{ctx}: left gap != right gap");
+                    // the picture must fit its box in pixels (the bug: it didn't once the font size changed)
+                    assert!(plan.key.side <= w as u32 * cell.0 as u32 && plan.key.side <= r.height as u32 * cell.1 as u32 + cell.1 as u32, "{ctx}");
+                    let (area_top, area_h) = (1u16, h - 6);
+                    let group = r.height + ZEN_TEXT_ROWS;
+                    let top_gap = r.y - area_top;
+                    let bottom_gap = area_h.saturating_sub(group + top_gap);
+                    assert!(top_gap.abs_diff(bottom_gap) <= 1, "{ctx}: vertical {top_gap}/{bottom_gap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zen_art_rows_never_exceed_what_is_available() {
+        for mode in [ArtMode::Sixel, ArtMode::HalfCell, ArtMode::Off] {
+            for avail in 0..40u16 {
+                for width in [0u16, 1, 20, 80, 200] {
+                    let rows = zen_art_rows(width, avail, (10, 20), mode);
+                    assert!(rows <= avail, "{mode:?} avail {avail} width {width} -> {rows}");
+                    assert_eq!(rows == 0, avail == 0 || width == 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn square_mode_uses_plain_corners_everywhere_and_rounded_otherwise() {
+        for (square, corner, other) in [(false, "╭", "┌"), (true, "┌", "╭")] {
+            let mut app = test_app(ArtMode::HalfCell);
+            app.zen = false;
+            app.square = square;
+            app.modal = Some(Modal::Help { scroll: 0 });
+            app.notify("a toast", Level::Info);
+            let t = render(&mut app, 150, 42);
+            let all: String = (0..42).map(|y| row_text(&t, y)).collect();
+            assert!(all.contains(corner), "square={square}: expected {corner} corners");
+            assert!(!all.contains(other), "square={square}: found stray {other} corners (panels, now-playing, modal or toast)");
+        }
+    }
+
+    #[test]
+    fn repeat_glyph_keeps_a_gap_before_the_right_border() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.queue.repeat = crate::queue::Repeat::One;
+        for w in [100u16, 150] {
+            let t = render(&mut app, w, 42);
+            let y = find_row(&t, "vol").unwrap();
+            let row: Vec<char> = row_text(&t, y).chars().collect();
+            let border = row.iter().rposition(|c| *c == '│').unwrap();
+            let last_glyph = row[..border].iter().rposition(|c| *c != ' ').unwrap();
+            assert!(border - last_glyph >= 3, "{w} cols: only {} blank cells before the border", border - last_glyph - 1);
+        }
+    }
+
+    #[test]
+    fn dividers_expose_grab_zones_and_dragging_resizes_panels() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let _ = render(&mut app, 150, 42);
+        let r = app.rects;
+        assert!(r.div_sidebar.width > 0 && r.div_side.width > 0 && r.div_cover.height > 0);
+        // the zones sit on the panel borders
+        assert_eq!(r.div_sidebar.x + 1, r.rects_tracks_x());
+        let before = app.layout;
+        app.layout = before.dragged(Divider::Sidebar, 40, 10, r.main, r.side_col);
+        let t = render(&mut app, 150, 42);
+        // the library panel is now 41 columns wide: its top-right corner is column 40
+        assert!(row_text(&t, 1).chars().nth(40).map_or(false, |c| "╮┐".contains(c)), "{}", row_text(&t, 1));
+    }
+}
+
+impl Rects {
+    #[cfg(test)]
+    fn rects_tracks_x(&self) -> u16 {
+        self.tracks.x
+    }
 }

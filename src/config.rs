@@ -239,6 +239,7 @@ pub const KEYBINDS: &[(&str, &str)] = &[
     ("refresh", "R"),
     ("theme_cycle", "t"),
     ("theme_pick", "T"),
+    ("border_style", "B"),
     ("zen", "z"),
     ("private_mode", "ctrl+y"),
     ("command_palette", "ctrl+p"),
@@ -259,6 +260,8 @@ pub struct Settings {
     pub replaygain_fallback: f64,
     pub audio_exclusive: bool,
     pub pipewire_buffer: i64,
+    /// `rounded` (default) or `square`
+    pub border_style: String,
     pub keybinds: HashMap<String, String>,
 }
 
@@ -276,6 +279,7 @@ impl Default for Settings {
             replaygain_fallback: 0.0,
             audio_exclusive: false,
             pipewire_buffer: 0,
+            border_style: "rounded".into(),
             keybinds: KEYBINDS
                 .iter()
                 .map(|(a, k)| (a.to_string(), k.to_string()))
@@ -361,6 +365,11 @@ impl Settings {
                         self.pipewire_buffer = i.max(0);
                     }
                 }
+                "border_style" => {
+                    if let Some(s) = str_in(value, &["rounded", "square"]) {
+                        self.border_style = s;
+                    }
+                }
                 "keybinds" => {
                     if let Some(kb) = value.as_table() {
                         for (action, keys) in kb {
@@ -433,6 +442,10 @@ const TEMPLATE: &str = r#"# Rustdrome player settings — restart the app after 
 # Bluetooth playback.
 #pipewire_buffer = 0
 
+# Box style: "rounded" (default) or "square" corners. Toggle at runtime with
+# the border_style keybind (B); the last choice made in the app is remembered.
+#border_style = "rounded"
+
 # Remap any key (Textual key names: space, slash, ctrl+up, shift+left, …).
 # Action ids and defaults:
 #[keybinds]
@@ -493,6 +506,7 @@ mod tests {
         let t: toml::Table = r#"
             replaygain = "track"
             gapless = "bogus"
+            border_style = "square"
             crossfade = 2
             nonsense = 1
             [keybinds]
@@ -504,6 +518,7 @@ mod tests {
         s.apply(&t);
         assert_eq!(s.replaygain, "track");
         assert_eq!(s.gapless, "weak", "invalid enum values are rejected");
+        assert_eq!(s.border_style, "square");
         assert_eq!(s.crossfade, 2.0, "bare ints are accepted for float knobs");
         assert_eq!(s.keybinds["next_track"], "ctrl+n");
         assert!(!s.keybinds.contains_key("not_an_action"));

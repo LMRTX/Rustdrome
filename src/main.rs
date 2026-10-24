@@ -8,6 +8,7 @@ mod app;
 mod art;
 mod clipboard;
 mod config;
+mod input;
 mod keys;
 mod mem;
 mod modal;
@@ -23,9 +24,8 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
-use futures::StreamExt;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app::{App, Level, Msg};
@@ -82,6 +82,8 @@ async fn real_main() -> Result<()> {
     let mut app = App::new(dirs, settings, tx);
     app.art_mode = art::resolve_mode(choice.as_deref(), probe.sixel);
     app.cell_px = sixel::cell_size(&probe);
+    app.cell_probe_ok = probe.cell_px.is_some();
+    app.win_sig = crossterm::terminal::window_size().ok().map(|w| (w.columns, w.rows, w.width, w.height));
     let ao = config::env("AO");
     match Player::spawn(&app.settings, ptx, ao.as_deref()).await {
         Ok(p) => app.player = p,
@@ -92,7 +94,9 @@ async fn real_main() -> Result<()> {
     }
     app.start();
 
-    let result = run(&mut terminal, &mut app, &mut rx, &mut prx).await;
+    let mut input = input::Input::spawn();
+    let result = run(&mut terminal, &mut app, &mut rx, &mut prx, &mut input).await;
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2026l"); // never leave the display held
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -103,25 +107,43 @@ async fn run(
     app: &mut App,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     prx: &mut player::PlayerEvents,
+    input: &mut input::Input,
 ) -> Result<()> {
-    let mut events = EventStream::new();
     // the one shared 8fps heartbeat that drives every animation
     let mut beat = tokio::time::interval(Duration::from_millis(125));
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !app.quit {
+        // one synchronized update per step: a resize's screen clear and the
+        // repaint that follows are presented together, never the blank between
+        sixel::begin_frame(terminal)?;
         terminal.draw(|f| ui::draw(f, app))?;
-        sixel::sync(app, terminal)?;
+        // `true` means the screen was cleared (the art panel had moved): repaint
+        // right now, in the same step, rather than leaving it blank until the next tick
+        if sixel::sync(app, terminal)? {
+            terminal.draw(|f| ui::draw(f, app))?;
+            sixel::sync(app, terminal)?;
+        }
+        sixel::end_frame(terminal)?;
         tokio::select! {
-            ev = events.next() => match ev {
-                Some(Ok(Event::Key(k))) => app.on_key(k),
-                Some(Ok(Event::Mouse(m))) => app.on_mouse(m),
-                // ratatui clears the screen on resize, which wipes any sixel
-                Some(Ok(Event::Resize(..))) => app.sixel.shown = None,
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
+            ev = input.rx.recv() => match ev {
+                Some(Event::Key(k)) => app.on_key(k),
+                Some(Event::Mouse(m)) => app.on_mouse(m),
+                // ratatui clears the screen on resize, which wipes any sixel; the
+                // cell size may have changed too (font zoom, another monitor)
+                Some(Event::Resize(..)) => {
+                    app.sixel.shown = None;
+                    if app.art_mode == art::ArtMode::Sixel {
+                        app.resize_at = Some(std::time::Instant::now());
+                    }
+                }
+                Some(_) => {}
+                None => break,
             },
-            _ = beat.tick() => app.on_tick(),
+            _ = beat.tick() => {
+                app.on_tick();
+                app.maintain_cell_size(input);
+            }
             Some(m) = rx.recv() => app.on_msg(m),
             Some(e) = prx.recv() => app.on_player_event(e),
         }
