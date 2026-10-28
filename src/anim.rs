@@ -1,7 +1,7 @@
 //! Animation primitives — pure functions the widgets call every tick.
 //!
-//! One shared 8fps heartbeat drives everything (logo shimmer, visualizer,
-//! progress pulse, marquee, spinners). Under the `system` theme colors can't
+//! One shared 8fps heartbeat drives everything (logo shimmer, progress pulse,
+//! marquee, spinners). Under the `system` theme colors can't
 //! be blended, so gradients collapse to flat styled text.
 
 use ratatui::style::{Modifier, Style};
@@ -10,15 +10,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::{blend, Theme};
 
-pub const NOTE_FRAMES: [&str; 4] = ["♪", "♫", "♪", "♬"];
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn spinner(tick: usize) -> &'static str {
     SPINNER[tick % SPINNER.len()]
-}
-
-pub fn note(tick: usize) -> &'static str {
-    NOTE_FRAMES[(tick / 3) % NOTE_FRAMES.len()]
 }
 
 // ── the shimmer ───────────────────────────────────────────────────────
@@ -153,75 +148,6 @@ pub fn fmt_time(seconds: f64) -> String {
     }
 }
 
-// ── the visualizer model ──────────────────────────────────────────────
-
-const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-/// Lively EQ bars: each bar eases toward a target that is either driven by the
-/// real playback loudness (when mpv's ebur128 meter is available) or a faked
-/// wobble. Energy 1.0 = playing, 0.0 = silent; pausing lets the bars fall to
-/// the floor instead of freezing mid-air.
-#[derive(Debug, Clone)]
-pub struct VizModel {
-    pub heights: Vec<f64>,
-    targets: Vec<f64>,
-    pub energy: f64,
-    t: f64,
-}
-
-impl VizModel {
-    pub fn new(bars: usize, seed: u32) -> Self {
-        Self {
-            heights: vec![0.0; bars],
-            targets: vec![0.0; bars],
-            energy: 0.0,
-            t: seed as f64,
-        }
-    }
-
-    pub fn tick(&mut self, level: Option<f64>) {
-        self.t += 1.0;
-        let n = self.heights.len();
-        let real = matches!(level, Some(l) if l > 0.02) && self.energy > 0.05;
-        for i in 0..n {
-            if real {
-                let level = level.unwrap_or(0.0);
-                let wob = ((self.t * 0.9 + i as f64 * 1.7).sin() + 1.0) / 2.0;
-                let shape = 0.55
-                    + 0.45 * (i as f64 / (n.max(2) - 1) as f64 * std::f64::consts::PI).sin();
-                self.targets[i] = (level * shape * (0.6 + 0.5 * wob)).clamp(0.0, 1.0);
-            } else if self.energy > 0.05 {
-                if (self.heights[i] - self.targets[i]).abs() < 0.08 {
-                    // deterministic-ish wobble: cheap hash of bar + time
-                    let r = (self.t * 12.9898 + i as f64 * 78.233).sin() * 43758.5453;
-                    self.targets[i] = (r - r.floor()) * self.energy;
-                }
-            } else {
-                self.targets[i] = 0.0;
-            }
-            self.heights[i] += (self.targets[i] - self.heights[i]) * 0.45;
-        }
-    }
-
-    pub fn render(&self, th: &Theme) -> Vec<Span<'static>> {
-        let n = self.heights.len();
-        self.heights
-            .iter()
-            .enumerate()
-            .map(|(i, &h)| {
-                let idx = ((h * (BLOCKS.len() - 1) as f64).round() as usize).min(BLOCKS.len() - 1);
-                let color = if th.can_blend() {
-                    let c = blend(th.blue, th.mauve, i as f64 / (n.max(2) - 1) as f64);
-                    blend(th.faint, c, 0.35 + 0.65 * h)
-                } else {
-                    th.blue
-                };
-                Span::styled(BLOCKS[idx].to_string(), Style::default().fg(color))
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,20 +192,5 @@ mod tests {
                 .sum();
             assert_eq!(w, 30, "at {pct}");
         }
-    }
-
-    #[test]
-    fn viz_falls_to_floor_when_silent() {
-        let mut v = VizModel::new(5, 7);
-        v.energy = 1.0;
-        for _ in 0..30 {
-            v.tick(Some(0.9));
-        }
-        assert!(v.heights.iter().any(|h| *h > 0.2));
-        v.energy = 0.0;
-        for _ in 0..60 {
-            v.tick(None);
-        }
-        assert!(v.heights.iter().all(|h| *h < 0.01));
     }
 }

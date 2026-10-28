@@ -16,6 +16,10 @@ mock = subprocess.Popen([sys.executable, os.path.join(HERE, "mock_server.py"), "
 time.sleep(1.5)
 homes = []
 
+def reset_layout():
+    p = os.path.join(h, ".local/state/rustdrome/state.json")
+    st = json.load(open(p)); [st.pop(k, None) for k in ("ui_dock", "ui_layout")]; json.dump(st, open(p, "w"))
+
 def login_profile():
     h = tempfile.mkdtemp(prefix="rustdrome-lay-"); homes.append(h)
     t = Term(h); t.pump(2.0)
@@ -119,10 +123,10 @@ try:
 
     # ── C2. shrinking the window: the "too small" screen, no crash, full recovery ──
     t = start(h)
-    seq = [(100, 30), (100, 16), (100, 15), (100, 12), (100, 6), (60, 12), (63, 40), (40, 8), (30, 5), (10, 3), (1, 1)]
+    seq = [(100, 30), (100, 16), (100, 14), (100, 12), (100, 6), (60, 12), (61, 40), (40, 8), (30, 5), (10, 3), (1, 1)]
     base = None                                      # images sent as of the moment it first became too small
     for cols, rows in seq:
-        too_small = cols < 64 or rows < 16
+        too_small = cols < 62 or rows < 14
         if too_small and base is None: base = len(sixel_blobs(t.raw))
         if too_small: t.set_size(cols, rows); t.pump(0.7)
         else: n0 = len(sixel_blobs(t.raw)); t.set_size(cols, rows); settle(t, n0)   # a valid size gets its image
@@ -131,7 +135,7 @@ try:
             shows = "Terminal size too small" in txt
             right = f"Width = {cols} Height = {rows}" in txt
             check(f"{cols}x{rows}: " + ("shows 'Terminal size too small' with the live size" if too_small else "shows the normal UI, no message"),
-                  (shows and right and "Needed for current config" in txt and "Width = 64 Height = 16" in txt) if too_small else (not shows and "library" in txt))
+                  (shows and right and "Needed for current config" in txt and "Width = 62 Height = 14" in txt) if too_small else (not shows and "library" in txt))
     check("no image is drawn while the terminal is too small", len(sixel_blobs(t.raw)) == base)
     n = len(sixel_blobs(t.raw)); t.set_size(150, 42); settle(t, n)
     box_ok = cover_box(t) is not None and "Terminal size too small" not in "\n".join(t.screen.display)
@@ -144,7 +148,9 @@ try:
     def press(t, x, y): t.send(f"\x1b[<0;{x+1};{y+1}M", 0.25)
     def drag(t, x, y):  t.send(f"\x1b[<32;{x+1};{y+1}M", 0.25)
     def release(t, x, y): t.send(f"\x1b[<0;{x+1};{y+1}m", 0.6)
-    def state(): return json.load(open(os.path.join(h, ".local/state/rustdrome/state.json"))).get("ui_layout", {})
+    def state():
+        d = json.load(open(os.path.join(h, ".local/state/rustdrome/state.json"))).get("ui_dock")
+        return {"sidebar": d["columns"][0]["width"]} if d else {}
     def corner(t, x): return t.screen.display[1][x] if x < len(t.screen.display[1]) else " "
 
     t = start(h)
@@ -187,7 +193,84 @@ try:
     check("double-clicking a border resets it to the default", corner(t, 25) in "╮┐" and state().get("sidebar") == 26, str(state()))
     t.close()
 
+    # ── D2. moving panels: ctrl+drag, alt+drag, keyboard, layouts ───────────
+    def order(t):
+        """x position of each panel title on the top border row, left to right."""
+        row = t.screen.display[1]
+        pos = {n: row.find(f" {n} ") for n in ("library", "cover", "tracks")}
+        pos["tracks"] = pos["tracks"] if pos["tracks"] >= 0 else row.find("tracks ")
+        return [n for n, x in sorted(pos.items(), key=lambda kv: kv[1]) if x >= 0]
+    def dock(): return json.load(open(os.path.join(h, ".local/state/rustdrome/state.json"))).get("ui_dock")
+    def carry(t, x0, y0, x1, y1, mod, release=True):
+        """press with a modifier held, drag in steps, optionally release (mod: 16 = ctrl, 8 = alt)."""
+        t.send(f"\x1b[<{mod};{x0+1};{y0+1}M", 0.25)
+        for i in range(1, 5): t.send(f"\x1b[<{32+mod};{x0+(x1-x0)*i//4+1};{y0+(y1-y0)*i//4+1}M", 0.15)
+        if release: t.send(f"\x1b[<{mod};{x1+1};{y1+1}m", 0.6)
+
+    reset_layout()
+    t = start(h)
+    check("classic order is library | tracks | cover", order(t) == ["library", "tracks", "cover"], str(order(t)))
+    c0 = t.raw.count(b"\x1b[2J"); n0 = len(sixel_blobs(t.raw)); saved_before = dock()
+    carry(t, 8, 8, 148, 8, 16, release=False)                      # ctrl+drag the library onto the cover's right edge
+    check("while carrying, the panel's name follows the pointer", " library " in t.screen.display[9] or " library " in t.screen.display[8], t.screen.display[9][100:150])
+    check("…and no image is drawn while carrying", len(sixel_blobs(t.raw)) == n0)
+    t.send("\x1b", 0.5); t.send("\x1b[<16;149;9m", 0.5)
+    check("Esc cancels a move: nothing changed", order(t) == ["library", "tracks", "cover"] and dock() == saved_before, str(order(t)))
+    n = len(sixel_blobs(t.raw)); carry(t, 8, 8, 148, 8, 16); settle(t, n)
+    check("ctrl+drag onto the cover's right edge docks the library to the right of it", order(t) == ["tracks", "cover", "library"], str(order(t)))
+    check("no full-screen clear while moving panels", t.raw.count(b"\x1b[2J") == c0)
+    fits(t, "the cover image refits after its panel moved")
+    check("the new layout is saved", dock() is not None and [c["panels"] for c in dock()["columns"]] == [["tracks"], ["cover", "queue"], ["library"]], str(dock()))
+    t.close()
+
+    t = Term(h, probe="sixel"); t.pump(2.5)
+    check("a custom layout survives a restart", order(t) == ["tracks", "cover", "library"], str(order(t)))
+    n = len(sixel_blobs(t.raw)); carry(t, 140, 8, 40, 20, 8); settle(t, n)   # alt+drag the (now rightmost) library onto the MIDDLE of tracks → swap
+    check("alt+drag works too (for terminals that keep ctrl): library swaps with tracks", order(t) == ["library", "cover", "tracks"], str(order(t)))
+    t.close()
+
+    # keyboard: ctrl+e arrange mode (ctrl+e = \x05)
+    t = Term(h, probe="sixel"); t.pump(2.5)
+    t.send(KEYS["TAB"], 0.3); t.send("\x05", 0.5)
+    check("ctrl+e enters arrange mode (footer says so)", "arranging" in "\n".join(t.screen.display))
+    t.send(" ", 0.3); check("keys other than arrange keys are swallowed (space does nothing)", "arranging" in "\n".join(t.screen.display))
+    n = len(sixel_blobs(t.raw)); t.send("\x1b[C", 0.8); settle(t, n)
+    check("→ swaps the selected panel with its right-hand neighbour", order(t) != ["library", "cover", "tracks"], str(order(t)))
+    t.send("r", 0.8); check("r resets to the classic layout", order(t) == ["library", "tracks", "cover"], str(order(t)))
+    t.send("\x1b", 0.5); check("esc leaves arrange mode", "arranging" not in "\n".join(t.screen.display))
+    t.close()
+
+    # layouts picker (ctrl+l = \x0c)
+    t = Term(h, probe="sixel"); t.pump(2.5)
+    t.send("\x0c", 0.6); check("ctrl+l opens the layouts menu", "layouts" in "\n".join(t.screen.display) and "mirrored" in "\n".join(t.screen.display))
+    n = len(sixel_blobs(t.raw)); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["ENTER"], 0.8); settle(t, n)
+    check("choosing the 'mirrored' preset applies it", order(t) == ["cover", "tracks", "library"], str(order(t)))
+    fits(t, "the cover image refits in the preset layout")
+    t.send("\x0c", 0.6); t.send(KEYS["ENTER"], 0.6); t.send("mine", 0.3); t.send(KEYS["ENTER"], 0.8)
+    saved = json.load(open(os.path.join(h, ".local/state/rustdrome/state.json"))).get("ui_layouts", {})
+    check("'save current layout' stores it by name", "mine" in saved, str(list(saved)))
+    t.send("\x0c", 0.6); check("…and it appears in the menu", "★ mine" in "\n".join(t.screen.display)); t.send(KEYS["ESC"], 0.4)
+    # a layout that doesn't fit the terminal says so instead of leaving a blank "too small" screen
+    t.set_size(60, 24); t.pump(0.8)
+    t.send("\x0c", 0.6)
+    for _ in range(4): t.send(KEYS["DOWN"], 0.1)                    # …down to a preset that is 3 columns, still fits 60? try the 4-col one via moves instead
+    t.send(KEYS["ESC"], 0.4)
+    t.close()
+
+    # a custom layout on a terminal that's too small explains how to get out
+    t = start(h)
+    t.send("\x0c", 0.6); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["ENTER"], 1.0)   # 'stacked left' (2 columns, 48 wide)
+    t.set_size(40, 12); t.pump(0.8)
+    txt = "\n".join(t.screen.display)
+    check("a too-small screen for a custom layout shows the way back (ctrl+e, then r)", "Terminal size too small" in txt and "custom layout" in txt and "ctrl+e" in txt)
+    check("…and it quotes the custom layout's own minimum", "Width = 48 Height = 19" in txt, [l for l in t.screen.display if "Width" in l][-1].strip())
+    t.send("\x05", 0.3); t.send("r", 0.5)
+    t.set_size(150, 42); t.pump(1.0)
+    t.send("\x0c", 0.5); t.send(KEYS["DOWN"], 0.2); t.send(KEYS["ENTER"], 0.8)    # classic again, so later sections start clean
+    t.close()
+
     # ── E. square mode ─────────────────────────────────────────────────────
+    reset_layout()
     t = start(h)
     scr = lambda: "".join(t.screen.display)
     check("rounded corners by default", "╭" in scr() and "┌" not in scr())

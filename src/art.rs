@@ -7,7 +7,8 @@
 //! to half-cells. `RUSTDROME_ART=off` shows a placeholder instead.)
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use image::imageops::FilterType;
 use image::RgbImage;
@@ -44,20 +45,79 @@ pub fn resolve_mode(env: Option<&str>, sixel_supported: bool) -> ArtMode {
     }
 }
 
-pub fn load(path: &Path) -> Option<RgbImage> {
-    // cached covers have no file extension, so sniff the format from content
-    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.to_rgb8();
+/// Decode a cover. Cached covers have no file extension, so the format is
+/// sniffed from the content.
+pub fn decode(path: &Path) -> Option<RgbImage> {
+    Some(image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.to_rgb8())
+}
+
+/// The small in-memory copy: half-cell rendering and the tint need nothing more.
+pub fn shrink(img: &RgbImage) -> RgbImage {
     let (w, h) = img.dimensions();
     if w.max(h) > MAX_EDGE {
         let s = MAX_EDGE as f64 / w.max(h) as f64;
-        return Some(image::imageops::resize(
-            &img,
+        return image::imageops::resize(
+            img,
             ((w as f64 * s).round() as u32).max(1),
             ((h as f64 * s).round() as u32).max(1),
             FilterType::Triangle,
-        ));
+        );
     }
-    Some(img)
+    img.clone()
+}
+
+#[cfg(test)]
+pub fn load(path: &Path) -> Option<RgbImage> {
+    decode(path).map(|i| shrink(&i))
+}
+
+/// Everything derived from one cover, produced from a SINGLE decode (it used
+/// to be decoded twice: once for the small copy, again for the sixel).
+pub struct Prepared {
+    pub path: PathBuf,
+    pub small: RgbImage,
+    pub tint: Option<Color>,
+    /// the sixel for the panel as it was laid out when this was prepared; only
+    /// used if the layout hasn't changed since
+    pub enc: Option<(crate::sixel::PlanKey, crate::sixel::Encoded)>,
+}
+
+/// Decode `path` once and build the small copy, the tint and — when a plan is
+/// known — the sixel. Blocking: run it off the UI thread.
+pub fn prepare(path: &Path, plan: Option<&(crate::sixel::Plan, (u16, u16))>) -> Option<Prepared> {
+    let img = decode(path)?;
+    let small = shrink(&img);
+    let tint = extract_vibrant(&small);
+    let enc = plan.map(|(p, cell)| (p.key, crate::sixel::encode_image(&img, p, *cell)));
+    Some(Prepared { path: path.to_path_buf(), small, tint, enc })
+}
+
+/// A couple of covers prepared ahead of time (the next track's), oldest evicted
+/// first. Tiny on purpose: each entry is ~100–400 KB.
+#[derive(Default)]
+pub struct ArtLru {
+    entries: VecDeque<(String, Prepared)>,
+}
+
+impl ArtLru {
+    pub const CAP: usize = 2;
+
+    pub fn contains(&self, cover: &str) -> bool {
+        self.entries.iter().any(|(c, _)| c == cover)
+    }
+
+    pub fn insert(&mut self, cover: String, p: Prepared) {
+        self.entries.retain(|(c, _)| *c != cover);
+        self.entries.push_back((cover, p));
+        while self.entries.len() > Self::CAP {
+            self.entries.pop_front();
+        }
+    }
+
+    pub fn take(&mut self, cover: &str) -> Option<Prepared> {
+        let i = self.entries.iter().position(|(c, _)| c == cover)?;
+        self.entries.remove(i).map(|(_, p)| p)
+    }
 }
 
 /// Pull one vibrant dominant color out of the cover.
@@ -204,6 +264,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn prepared(tag: u8) -> Prepared {
+        Prepared { path: PathBuf::from(format!("/x/{tag}")), small: RgbImage::new(1, 1), tint: None, enc: None }
+    }
+
+    #[test]
+    fn lru_holds_two_evicts_the_oldest_and_hands_entries_over_once() {
+        let mut l = ArtLru::default();
+        l.insert("a".into(), prepared(1));
+        l.insert("b".into(), prepared(2));
+        assert!(l.contains("a") && l.contains("b"));
+        l.insert("c".into(), prepared(3));
+        assert!(!l.contains("a"), "oldest evicted at capacity {}", ArtLru::CAP);
+        let b = l.take("b").expect("hit");
+        assert_eq!(b.path, PathBuf::from("/x/2"));
+        assert!(l.take("b").is_none(), "an entry is handed over once");
+        // re-inserting the same cover replaces, never duplicates
+        l.insert("c".into(), prepared(9));
+        assert_eq!(l.take("c").unwrap().path, PathBuf::from("/x/9"));
+        assert!(l.take("c").is_none());
+    }
+
+    #[test]
+    fn prepare_decodes_once_and_builds_everything_from_it() {
+        use crate::sixel::plan;
+        let dir = std::env::temp_dir().join(format!("rustdrome-prep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("al9-640"); // no extension, like the real cache
+        let mut img = RgbImage::new(400, 400);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgb([(x / 2) as u8, (y / 2) as u8, 180]);
+        }
+        img.save_with_format(&path, image::ImageFormat::Png).unwrap();
+
+        let p = plan(Rect::new(0, 0, 34, 12), (10, 20)).unwrap();
+        let got = prepare(&path, Some(&(p, (10, 20)))).expect("prepared");
+        assert!(got.small.width().max(got.small.height()) <= MAX_EDGE);
+        assert!(got.tint.is_some());
+        let (key, enc) = got.enc.expect("a sixel was built from the same decode");
+        assert_eq!(key, p.key);
+        assert_eq!((enc.width, enc.height), (p.key.cols as u32 * 10, p.key.rows as u32 * 20));
+        assert!(enc.data.starts_with(b"\x1bP0;1;0q"));
+        // without a layout to encode for, only the cheap parts are produced
+        assert!(prepare(&path, None).unwrap().enc.is_none());
+        assert!(prepare(&dir.join("missing"), None).is_none());
     }
 
     #[test]

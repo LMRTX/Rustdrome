@@ -1,25 +1,51 @@
 import json, math, struct, io, sys, wave, hashlib, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-from PIL import Image
+from PIL import Image, ImageFilter
+import random, time
 
 PASSWORD="sesame"
+COVERS=int(os.environ.get('MOCK_COVERS','5'))          # distinct albums/covers
+LATENCY=float(os.environ.get('MOCK_LATENCY_MS','0'))/1000   # simulated network latency on cover requests
+_COVER_CACHE={}
 ARTISTS=["Nina Simone","Daft Punk","Radiohead","Bonobo"]
 SONGS=[]
 for i in range(1,int(os.environ.get('MOCK_SONGS','40'))+1):
     SONGS.append({"id":str(i),"title":f"Track {i:02d} {['Alpha','Bravo','Charlie','Delta'][i%4]}","artist":f"{ARTISTS[i%4]} {i%137}",
-      "album":f"Album {i%500}","albumId":f"al{i%5}","artistId":f"ar{i%4}","duration":20,"coverArt":f"al{i%5}","suffix":"wav","track":i,"year":2000+i%20})
+      "album":f"Album {i%500}","albumId":f"al{i%COVERS}","artistId":f"ar{i%4}","duration":(int(os.environ.get("MOCK_WAV_SECONDS","0")) or 20),"coverArt":f"al{i%COVERS}","suffix":"wav","track":i,"year":2000+i%20})
 LOG=[]
 def wav(seconds=20):
     b=io.BytesIO(); w=wave.open(b,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
     w.writeframes(b"".join(struct.pack("<h",int(8000*math.sin(2*math.pi*440*t/22050))) for t in range(22050*seconds))); w.close(); return b.getvalue()
-WAV=wav()
-def png(i):
-    im=Image.new("RGB",(64,64),(30,30,30))
-    for x in range(64):
-        for y in range(64):
-            im.putpixel((x,y),((x*4+i*50)%256,(y*4)%256,(200-i*30)%256))
-    b=io.BytesIO(); im.save(b,"PNG"); return b.getvalue()
+def big_wav(seconds):
+    """A real-sized lossless track (44.1 kHz stereo 16-bit ≈ 10 MB/min) of noise — only its size matters."""
+    n=seconds*44100*4; b=io.BytesIO(); w=wave.open(b,"wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
+    w.writeframes(os.urandom(n)); w.close(); return b.getvalue()
+SECONDS=int(os.environ.get("MOCK_WAV_SECONDS","0"))
+WAV=big_wav(SECONDS) if SECONDS else wav()
+def png(i, size=640):
+    """A photo-ish cover: smooth gradient, soft blobs and film grain, as a JPEG (like real artwork)."""
+    key=(i,size)
+    if key in _COVER_CACHE: return _COVER_CACHE[key]
+    rnd=random.Random(i)
+    base=Image.new("RGB",(size//4,size//4))
+    px=base.load()
+    c1=(rnd.randrange(256),rnd.randrange(256),rnd.randrange(256)); c2=(rnd.randrange(256),rnd.randrange(256),rnd.randrange(256))
+    for y in range(size//4):
+        for x in range(size//4):
+            t=(x+y)/(size/2)
+            px[x,y]=tuple(int(c1[k]*(1-t)+c2[k]*t) for k in range(3))
+    for _ in range(14):
+        cx,cy,r=rnd.randrange(size//4),rnd.randrange(size//4),rnd.randrange(8,size//8)
+        col=(rnd.randrange(256),rnd.randrange(256),rnd.randrange(256))
+        for y in range(max(0,cy-r),min(size//4,cy+r)):
+            for x in range(max(0,cx-r),min(size//4,cx+r)):
+                if (x-cx)**2+(y-cy)**2<r*r: px[x,y]=tuple((px[x,y][k]*2+col[k])//3 for k in range(3))
+    im=base.resize((size,size),Image.BICUBIC).filter(ImageFilter.GaussianBlur(1))
+    noise=Image.effect_noise((size,size),18).convert("RGB")
+    im=Image.blend(im,noise,0.16)
+    b=io.BytesIO(); im.save(b,"JPEG",quality=85); data=b.getvalue()
+    _COVER_CACHE[key]=data; return data
 class H(BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def send_json(self,body):
@@ -57,7 +83,8 @@ class H(BaseHTTPRequestHandler):
         elif ep in("stream","download"):
             self.send_response(200); self.send_header("Content-Type","audio/wav"); self.send_header("Content-Length",str(len(WAV))); self.end_headers(); self.wfile.write(WAV)
         elif ep=="getCoverArt":
-            d=png(int(q["id"][0][2:])); self.send_response(200); self.send_header("Content-Type","image/png"); self.send_header("Content-Length",str(len(d))); self.end_headers(); self.wfile.write(d)
+            if LATENCY: time.sleep(LATENCY)
+            d=png(int(q["id"][0][2:]), int(q.get("size",["640"])[0])); self.send_response(200); self.send_header("Content-Type","image/jpeg"); self.send_header("Content-Length",str(len(d))); self.end_headers(); self.wfile.write(d)
         elif ep in("scrobble","star","unstar","setRating","updatePlaylist","createPlaylist","createBookmark","deletePlaylist"): self.send_json({})
         elif ep=="getBookmarks": self.send_json({"bookmarks":{}})
         elif ep=="createShare": self.send_json({"shares":{"share":[{"url":"https://example.test/share/abc"}]}})
@@ -65,4 +92,6 @@ class H(BaseHTTPRequestHandler):
     def _fail(self):
         d=json.dumps({"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}).encode()
         self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(d))); self.end_headers(); self.wfile.write(d)
+# warm the cover cache so measurements see the app's cost, not this script generating images
+for _i in range(min(COVERS, 64)): png(_i, 640)
 ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()

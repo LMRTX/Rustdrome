@@ -10,24 +10,28 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::anim;
 use crate::app::*;
+use crate::dock::PanelId;
 use crate::modal::*;
 use crate::queue::Repeat;
 use crate::stats;
 use crate::theme::Theme;
 
-/// Smallest terminal the normal layout works in: the three columns need at
-/// least `14 + 24 + 24` cells (library, tracks, cover/queue), and the rows are
-/// the top bar, ~10 rows of panels, the 4-row now-playing box and the footer.
-pub const MIN_SIZE: (u16, u16) = (64, 16);
-/// Zen mode has no columns, so it needs far less width — but the cover plus its
+/// Rows taken by everything that isn't a panel: the top bar, the 4-row
+/// now-playing box and the footer.
+const CHROME_ROWS: u16 = 6;
+/// Zen mode has no panels, so it needs far less width — but the cover plus its
 /// nine rows of text, plus the bars above and below.
 pub const MIN_SIZE_ZEN: (u16, u16) = (30, 20);
 
-pub fn min_size(zen: bool) -> (u16, u16) {
-    if zen {
+/// Smallest terminal the *current* layout works in: whatever the panels'
+/// minimum sizes add up to in the arrangement the user has chosen, plus the
+/// bars. So "needed for current config" is literally true.
+pub fn min_size(app: &App) -> (u16, u16) {
+    if app.zen {
         MIN_SIZE_ZEN
     } else {
-        MIN_SIZE
+        let (w, h) = app.dock.min_size();
+        (w, h + CHROME_ROWS)
     }
 }
 
@@ -122,6 +126,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("t", "cycle themes"),
             ("B", "square / rounded boxes"),
+            ("ctrl+l", "layouts: presets, save your own"),
+            ("ctrl+e", "arrange panels with the keyboard"),
+            ("ctrl/alt+drag", "move a panel; edges dock, middle swaps"),
+            ("drag borders", "resize panels (double-click resets)"),
             ("T", "theme picker (live preview)"),
             ("N", "toggle notifications"),
             ("ctrl+y", "private listening"),
@@ -190,12 +198,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.overlay_rects.clear();
     f.render_widget(Block::default().style(th.base()), area);
 
-    let (min_w, min_h) = min_size(app.zen);
+    let (min_w, min_h) = min_size(app);
     if area.width < min_w || area.height < min_h {
         // Nothing fits, so draw nothing else — not even a modal. Forget the
         // hit-boxes too, so a click can't land on a panel that isn't there.
         app.rects = Rects::default();
-        draw_too_small(f, area, (min_w, min_h), &th);
+        let custom = !app.zen && app.dock != crate::dock::Dock::classic();
+        draw_too_small(f, area, (min_w, min_h), custom, &th);
         return;
     }
 
@@ -224,7 +233,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// "Terminal size too small" — the current size with each dimension green
 /// when it's enough and red when it isn't, and what's needed.
-fn draw_too_small(f: &mut Frame, area: Rect, need: (u16, u16), th: &Theme) {
+fn draw_too_small(f: &mut Frame, area: Rect, need: (u16, u16), custom: bool, th: &Theme) {
     if area.width >= 3 && area.height >= 3 {
         f.render_widget(
             Block::default().borders(Borders::ALL).border_type(th.bt).border_style(Style::default().fg(th.border_focus)),
@@ -249,6 +258,12 @@ fn draw_too_small(f: &mut Frame, area: Rect, need: (u16, u16), th: &Theme) {
         Line::from(Span::styled("Needed for current config:", th.bold(th.text))).centered(),
         size(need.0, need.1, th.fg(th.text), th.fg(th.text)),
     ];
+    let mut lines = lines;
+    if custom {
+        // you may have just made the layout bigger than the window: say how to undo it
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("custom layout — ctrl+e, then r, resets it", th.fg(th.dim))).centered());
+    }
     let h = lines.len() as u16;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let inner = Rect::new(area.x, y, area.width, h.min(area.height.saturating_sub(y - area.y)));
@@ -256,10 +271,7 @@ fn draw_too_small(f: &mut Frame, area: Rect, need: (u16, u16), th: &Theme) {
 }
 
 fn draw_topbar(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled(format!("{} ", anim::note(app.logo_phase as usize)), Style::default().fg(th.mauve)),
-    ];
+    let mut left = vec![Span::raw(" ")];
     left.extend(anim::shimmer("Rustdrome", app.logo_phase, th.mauve, th.text, th));
     f.render_widget(Paragraph::new(Line::from(left)), area);
 
@@ -285,42 +297,103 @@ fn draw_topbar(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
 }
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
-    let l = app.layout.clamped(area.width);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(l.sidebar), Constraint::Min(10), Constraint::Length(l.side)])
-        .split(area);
-    draw_sidebar(f, app, cols[0], th);
-    draw_tracks(f, app, cols[1], th);
-    // cover gets a share of the right column; the queue keeps at least 4 rows
-    let cover_h = fit((area.height as u32 * l.cover_pct as u32 / 100) as u16, 4, area.height.saturating_sub(4));
-    let side = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(cover_h), Constraint::Min(4)])
-        .split(cols[2]);
-    draw_art(f, app, side[0], th, true);
-    draw_queue(f, app, side[1], th);
-
-    // grab zones: the two border columns (or rows) either side of a boundary
+    let arr = app.dock.arrange(area);
+    for (id, rect) in &arr.panels {
+        match id {
+            PanelId::Library => draw_sidebar(f, app, *rect, th),
+            PanelId::Tracks => draw_tracks(f, app, *rect, th),
+            PanelId::Cover => draw_art(f, app, *rect, th, true),
+            PanelId::Queue => draw_queue(f, app, *rect, th),
+        }
+    }
+    // remember where everything went, for the mouse
     app.rects.main = area;
-    app.rects.side_col = cols[2];
-    app.rects.div_sidebar = Rect::new(cols[0].x + cols[0].width.saturating_sub(1), area.y, 2, area.height);
-    app.rects.div_side = Rect::new(cols[1].x + cols[1].width.saturating_sub(1), area.y, 2, area.height);
-    app.rects.div_cover = Rect::new(cols[2].x, side[0].y + side[0].height.saturating_sub(1), cols[2].width, 2);
+    app.rects.arranged = arr.clone();
+
     if let Some(d) = app.drag {
-        let zone = match d {
-            Divider::Sidebar => app.rects.div_sidebar,
-            Divider::Side => app.rects.div_side,
-            Divider::Cover => app.rects.div_cover,
-        };
-        for y in zone.y..zone.y + zone.height {
-            for x in zone.x..zone.x + zone.width {
-                if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
-                    c.set_fg(th.mauve);
+        // light up the boundary being dragged
+        if let Some((_, zone)) = arr.dividers.iter().find(|(x, _)| *x == d) {
+            for y in zone.y..zone.y + zone.height {
+                for x in zone.x..zone.x + zone.width {
+                    if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+                        c.set_fg(th.mauve);
+                    }
                 }
             }
         }
     }
+    if let Some(mv) = app.moving {
+        draw_move_overlay(f, &arr, mv, th);
+    }
+    if let Some(sel) = app.arrange {
+        if let Some(r) = arr.rect(sel) {
+            recolor_border(f, r, th.mauve);
+        }
+    }
+}
+
+/// Recolour a panel's existing border (keeping its glyphs and title) — drawing
+/// a new border over it would erase the title.
+fn recolor_border(f: &mut Frame, r: Rect, color: ratatui::style::Color) {
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    let (x1, y1) = (r.x + r.width - 1, r.y + r.height - 1);
+    let mut paint = |x: u16, y: u16| {
+        if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+            c.set_style(Style::default().fg(color).add_modifier(ratatui::style::Modifier::BOLD));
+        }
+    };
+    for x in r.x..=x1 {
+        paint(x, r.y);
+        paint(x, y1);
+    }
+    for y in r.y..=y1 {
+        paint(r.x, y);
+        paint(x1, y);
+    }
+}
+
+/// While a panel is being carried: dim where it came from, preview where it
+/// would land (the half of the target it would take, tinted and outlined), and
+/// tag the pointer with its name.
+fn draw_move_overlay(f: &mut Frame, arr: &crate::dock::Arranged, mv: Moving, th: &Theme) {
+    let tint = |f: &mut Frame, r: Rect, strong: bool| {
+        for y in r.y..r.y + r.height {
+            for x in r.x..r.x + r.width {
+                if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+                    if strong {
+                        if th.can_blend() {
+                            c.set_bg(crate::theme::blend(th.modal_bg, th.mauve, 0.38));
+                        } else {
+                            c.set_style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED));
+                        }
+                    } else {
+                        c.set_style(Style::default().add_modifier(ratatui::style::Modifier::DIM));
+                    }
+                }
+            }
+        }
+    };
+    if let Some(src) = arr.rect(mv.panel) {
+        tint(f, src, false);
+    }
+    if let Some(target) = arr.panel_at(mv.x, mv.y).filter(|t| *t != mv.panel) {
+        if let Some(r) = arr.rect(target) {
+            let zone = crate::dock::zone_at(r, mv.x, mv.y);
+            let pr = crate::dock::preview_rect(r, zone);
+            tint(f, pr, true);
+            f.render_widget(Block::default().borders(Borders::ALL).border_type(th.bt).border_style(th.bold(th.mauve)), pr);
+        }
+    }
+    let label = format!(" {} ", mv.panel.label());
+    let fr = f.area();
+    let w = label.chars().count() as u16;
+    let (x, y) = ((mv.x + 2).min(fr.width.saturating_sub(w)), (mv.y + 1).min(fr.height.saturating_sub(1)));
+    f.render_widget(
+        Paragraph::new(Span::styled(label, Style::default().fg(th.modal_bg).bg(th.mauve).add_modifier(ratatui::style::Modifier::BOLD))),
+        Rect::new(x, y, w.min(fr.width), 1),
+    );
 }
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
@@ -414,7 +487,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             ));
         }
         spans.push(Span::styled(s.title.clone(), if is_cur { th.bold(th.blue) } else { th.fg(th.text) }));
-        if client.as_ref().is_some_and(|c| c.cached_stream(&s.id).is_some()) {
+        if client.as_ref().is_some_and(|c| c.is_pinned(&s.id)) {
             spans.push(Span::styled(format!(" {CHECK}"), th.fg(th.green)));
         }
         if s.starred {
@@ -451,6 +524,9 @@ fn draw_art(f: &mut Frame, app: &mut App, area: Rect, th: &Theme, bordered: bool
         // blank — drawing glyphs under a bitmap would fight with it.
         let cover = app.now_song.as_ref().and_then(|s| s.cover_art.clone());
         let ready = matches!((&app.art, &cover), (Some((id, _)), Some(c)) if id == c);
+        if !app.settling() {
+            app.sixel.plan_hint = crate::sixel::plan(inner, app.cell_px).map(|p| (p, app.cell_px));
+        }
         // while the layout is still changing (divider drag, zoom, window resize)
         // show nothing until it settles, then encode once at the right size
         if let (true, Some(cover), false) = (ready, cover, app.settling()) {
@@ -544,8 +620,7 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
     let width = inner.width as usize;
 
     // ── top line ──
-    let mut top: Vec<Span> = anim::VizModel::render(&app.viz, th);
-    top.push(Span::raw("  "));
+    let mut top: Vec<Span> = vec![Span::raw(" ")];
     match &app.now_song {
         None => {
             top.push(Span::styled("nothing playing", th.fg(th.dim)));
@@ -715,6 +790,18 @@ fn key_label(spec: &str) -> String {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
+    if let Some(sel) = app.arrange {
+        let mut spans = vec![Span::styled(format!(" arranging {} ", sel.label()), th.bold(th.mauve)), Span::styled("  ", th.fg(th.vfaint))];
+        for (i, (k, d)) in [("←↑↓→", "swap"), ("shift+←↑↓→", "dock beside"), ("tab", "next panel"), ("r", "reset"), ("esc", "done")].iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("  ", th.fg(th.vfaint)));
+            }
+            spans.push(Span::styled(k.to_string(), th.fg(th.blue)));
+            spans.push(Span::styled(format!(" {d}"), th.fg(th.dim)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let kb = |id: &str| key_label(app.settings.keybinds.get(id).map_or("", |s| s.as_str()));
     let hints = [
         ("play_pause", "play/pause"),
@@ -821,7 +908,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             let block = modal_block("connect to your navidrome", th);
             let inner = block.inner(r);
             f.render_widget(block, r);
-            let mut head = vec![Span::raw(" "), Span::styled(format!("{} ", anim::note(logo_phase as usize)), th.fg(th.mauve))];
+            let mut head = vec![Span::raw(" ")];
             head.extend(anim::shimmer("Rustdrome", logo_phase, th.mauve, th.text, th));
             let mut lines = vec![
                 Line::from(head),
@@ -1172,6 +1259,9 @@ mod tests {
         }
     }
 
+    /// The classic layout's minimum, as `(width, height)` of the whole screen.
+    const MIN_SIZE: (u16, u16) = (14 + 24 + 24, 8 + CHROME_ROWS);
+
     /// Every screen the app can show, ready to be rendered at any size.
     fn scenarios() -> Vec<(&'static str, App)> {
         use crate::modal::{InputModal, InputPurpose, LyricsModal, Login, PickKind, Picker, SearchModal, TextField};
@@ -1351,24 +1441,194 @@ mod tests {
 
     #[test]
     fn dividers_expose_grab_zones_and_dragging_resizes_panels() {
+        use crate::dock::Divider;
         let mut app = test_app(ArtMode::HalfCell);
         app.zen = false;
         let _ = render(&mut app, 150, 42);
-        let r = app.rects;
-        assert!(r.div_sidebar.width > 0 && r.div_side.width > 0 && r.div_cover.height > 0);
-        // the zones sit on the panel borders
-        assert_eq!(r.div_sidebar.x + 1, r.rects_tracks_x());
-        let before = app.layout;
-        app.layout = before.dragged(Divider::Sidebar, 40, 10, r.main, r.side_col);
+        let zones = app.rects.arranged.dividers.clone();
+        assert_eq!(zones.len(), 3, "two column boundaries and one row boundary in the classic layout");
+        let col0 = zones.iter().find(|(d, _)| *d == Divider::Col(0)).unwrap().1;
+        assert_eq!(col0.x + 1, app.rects.tracks.x, "the zone sits on the library/tracks border");
+        // dragging that boundary resizes the library panel
+        let main = app.rects.main;
+        app.dock.resize_col(0, 40, main);
         let t = render(&mut app, 150, 42);
         // the library panel is now 41 columns wide: its top-right corner is column 40
         assert!(row_text(&t, 1).chars().nth(40).map_or(false, |c| "╮┐".contains(c)), "{}", row_text(&t, 1));
     }
-}
 
-impl Rects {
-    #[cfg(test)]
-    fn rects_tracks_x(&self) -> u16 {
-        self.tracks.x
+    /// Every on-screen panel's title, to see where things ended up.
+    fn titles(t: &Terminal<TestBackend>) -> Vec<(String, u16)> {
+        let row = row_text(t, 1);
+        ["library", "tracks", "all tracks", "cover", "queue"]
+            .iter()
+            .filter_map(|n| row.find(&format!(" {n} ")).map(|x| (n.to_string(), row[..x].chars().count() as u16)))
+            .collect()
+    }
+
+    #[test]
+    fn moving_a_panel_rearranges_what_is_drawn_and_adjusts_the_too_small_limit() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let t = render(&mut app, 150, 42);
+        let x = |t: &Terminal<TestBackend>, name: &str| titles(t).iter().find(|(n, _)| n == name).map(|(_, x)| *x).unwrap_or_else(|| panic!("no {name} in {:?}", titles(t)));
+        assert!(x(&t, "library") < x(&t, "cover"), "classic: library left of cover");
+
+        // pick the library up and drop it on the cover's right edge
+        let cover = app.rects.arranged.rect(PanelId::Cover).unwrap();
+        app.finish_move(Moving { panel: PanelId::Library, x: cover.x + cover.width - 1, y: cover.y + 3 });
+        let t = render(&mut app, 150, 42);
+        assert!(x(&t, "library") > x(&t, "cover"), "library now right of the cover: {:?}", titles(&t));
+        assert_eq!(app.dock.columns.len(), 3);
+
+        // swap two panels by dropping on the middle of one
+        let tr = app.rects.arranged.rect(PanelId::Tracks).unwrap();
+        app.finish_move(Moving { panel: PanelId::Library, x: tr.x + tr.width / 2, y: tr.y + tr.height / 2 });
+        let t = render(&mut app, 150, 42);
+        // before the swap the order was tracks | cover | library; the library and tracks exchange
+        // places, so it becomes library | cover | tracks
+        assert!(x(&t, "library") < x(&t, "cover") && x(&t, "cover") < x(&t, "tracks"), "{:?}", titles(&t));
+        // dropping a panel on itself, or on nothing, changes nothing
+        let before = app.dock.clone();
+        app.finish_move(Moving { panel: PanelId::Cover, x: 0, y: 0 });
+        app.finish_move(Moving { panel: PanelId::Cover, x: 999, y: 999 });
+        assert_eq!(app.dock, before);
+    }
+
+    #[test]
+    fn a_layout_wider_than_the_terminal_is_refused_not_applied() {
+        // the "too small" screen hides every menu, so a layout that doesn't fit must never be applied
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let _ = render(&mut app, 70, 30); // 70 cols: the 4-column preset needs 84
+        let four_wide = crate::dock::Dock {
+            columns: PanelId::ALL
+                .iter()
+                .map(|p| crate::dock::Column { panels: vec![*p], weights: vec![100], width: p.default_width() })
+                .collect(),
+        };
+        let before = app.dock.clone();
+        assert!(!app.try_dock(four_wide.clone(), "that layout"));
+        assert_eq!(app.dock, before);
+        assert!(app.toasts.iter().any(|t| t.text.contains("needs at least 84")), "{:?}", app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>());
+        // …but it is fine on a terminal that is wide enough
+        let _ = render(&mut app, 120, 30);
+        assert!(app.try_dock(four_wide, "that layout"));
+        assert_eq!(app.dock.columns.len(), 4);
+    }
+
+    #[test]
+    fn the_too_small_limit_follows_the_layout() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        assert_eq!(min_size(&app), MIN_SIZE);
+        let tall = crate::dock::Dock::presets()[2].1.clone(); // stacked left: 2 columns, 13 rows of panels
+        app.dock = tall.clone();
+        assert_eq!(min_size(&app), (24 + 24, 13 + CHROME_ROWS));
+        // a custom layout that doesn't fit says how to undo it
+        let t = render(&mut app, 40, 12);
+        assert!(find_row(&t, "custom layout").is_some() && find_row(&t, "ctrl+e").is_some());
+        app.dock = crate::dock::Dock::classic();
+        let t = render(&mut app, 40, 12);
+        assert!(find_row(&t, "custom layout").is_none(), "the hint is only for custom layouts");
+    }
+
+    #[test]
+    fn arrange_mode_swaps_docks_cycles_resets_and_never_traps_the_quit_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode, m: KeyModifiers| KeyEvent::new(c, m);
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let _ = render(&mut app, 150, 42);
+        app.focus = Focus::Sidebar;
+        app.enter_arrange();
+        assert_eq!(app.arrange, Some(PanelId::Library));
+        // →: swap the library with its right-hand neighbour (the tracks)
+        app.on_key(key(KeyCode::Right, KeyModifiers::NONE));
+        let _ = render(&mut app, 150, 42);
+        let lib = app.rects.arranged.rect(PanelId::Library).unwrap();
+        let trk = app.rects.arranged.rect(PanelId::Tracks).unwrap();
+        assert!(trk.x < lib.x, "tracks is now left of the library");
+        // tab moves the selection; keys that mean nothing here are swallowed, not acted on
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_ne!(app.arrange, Some(PanelId::Library));
+        let playing_before = app.player.paused();
+        app.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.player.paused(), playing_before, "space is consumed in arrange mode");
+        // shift+arrow docks beside the neighbour rather than swapping
+        app.arrange = Some(PanelId::Queue);
+        let _ = render(&mut app, 150, 42);
+        app.on_key(key(KeyCode::Up, KeyModifiers::SHIFT));
+        let _ = render(&mut app, 150, 42);
+        assert_eq!(app.dock.find(PanelId::Queue).map(|(_, i)| i), Some(0), "queue docked above the cover");
+        // r resets
+        app.on_key(key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.dock, crate::dock::Dock::classic());
+        // quit always works, even here
+        app.on_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit, "the quit key must not be trapped by arrange mode");
+        // esc leaves the mode
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let _ = render(&mut app, 150, 42);
+        app.enter_arrange();
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.arrange, None);
+    }
+
+    #[test]
+    fn arrange_highlight_recolours_the_border_and_keeps_the_title() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let th = app.theme();
+        let t = render(&mut app, 150, 42);
+        let tr = app.rects.arranged.rect(PanelId::Tracks).unwrap();
+        let title_before = row_text(&t, tr.y);
+        let plain = t.backend().buffer().cell((tr.x, tr.y)).unwrap().fg;
+        app.arrange = Some(PanelId::Tracks);
+        let t = render(&mut app, 150, 42);
+        assert_eq!(row_text(&t, tr.y), title_before, "the panel keeps its title while selected");
+        let cell = t.backend().buffer().cell((tr.x, tr.y)).unwrap();
+        assert_eq!(cell.fg, th.mauve);
+        assert_ne!(cell.fg, plain, "the border colour changed");
+        // the far corner is highlighted too, so the whole outline reads as selected
+        assert_eq!(t.backend().buffer().cell((tr.x + tr.width - 1, tr.y + tr.height - 1)).unwrap().fg, th.mauve);
+    }
+
+    #[test]
+    fn move_preview_is_drawn_while_carrying_and_cancelled_by_escape() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        let _ = render(&mut app, 150, 42);
+        let q = app.rects.arranged.rect(PanelId::Queue).unwrap();
+        app.moving = Some(Moving { panel: PanelId::Library, x: q.x + 4, y: q.y + 2 });
+        let t = render(&mut app, 150, 42);
+        // the pointer is tagged with the carried panel's name
+        assert!(row_text(&t, q.y + 3).contains(" library "), "{}", row_text(&t, q.y + 3));
+        assert!(app.settling(), "the sixel image stays out of the way while carrying");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.moving.is_none());
+        let before = app.dock.clone();
+        let _ = render(&mut app, 150, 42);
+        assert_eq!(app.dock, before, "cancelling moved nothing");
+    }
+
+    #[test]
+    fn saved_layouts_round_trip_through_state_and_appear_in_the_menu() {
+        use crate::modal::{InputPurpose, LayoutChoice, PickKind};
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.dock = crate::dock::Dock::presets()[1].1.clone();
+        app.on_input(InputPurpose::SaveLayout, "my setup".into());
+        app.dock = crate::dock::Dock::classic();
+        app.layout_menu();
+        let Some(Modal::Picker(p)) = &app.modal else { panic!("no picker") };
+        let PickKind::Layout(choices) = &p.kind else { panic!("wrong picker") };
+        // save-current + the 4 presets + the saved one
+        assert_eq!(choices.len(), 1 + 4 + 1, "{:?}", p.items);
+        assert!(p.items.iter().any(|i| i == "★ my setup"));
+        let LayoutChoice::Apply(saved) = choices.last().unwrap() else { panic!() };
+        assert_eq!(*saved, crate::dock::Dock::presets()[1].1);
     }
 }

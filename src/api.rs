@@ -106,7 +106,10 @@ pub struct SubsonicClient {
     token: String,
     salt: String,
     art_dir: PathBuf,
+    /// explicit downloads — kept until the user removes them
     audio_dir: PathBuf,
+    /// look-ahead files — bounded, evicted automatically (`audio-cache/`)
+    prefetch_dir: PathBuf,
     /// Streaming transcode cap `(kbps, format)`; `(0, "")` is original
     /// quality. Mutable so a runtime toggle retunes later streams.
     quality: Mutex<(i64, String)>,
@@ -135,6 +138,7 @@ impl SubsonicClient {
             token: token.into(),
             salt: salt.into(),
             art_dir,
+            prefetch_dir: audio_dir.with_file_name("audio-cache"),
             audio_dir,
             quality: Mutex::new((max_bitrate, stream_format.into())),
             http,
@@ -575,69 +579,155 @@ impl SubsonicClient {
         Ok(path)
     }
 
-    // ── audio cache (offline pins) ────────────────────────────────────
-    // Original files are pinned by id under the audio cache dir, with the id
-    // kept opaque (no suffix): the server may transcode or the suffix may be
-    // unknown offline, and mpv probes the container regardless.
+    // ── audio files on disk ───────────────────────────────────────────
+    // Two kinds, kept apart on purpose:
+    //  * `audio/`        — explicit downloads (d / D / ctrl+d). Yours: never evicted.
+    //  * `audio-cache/`  — the next track, fetched ahead of time so it starts
+    //                      instantly. Bounded: old ones are deleted as new ones
+    //                      arrive, so playing for hours doesn't fill the disk
+    //                      (or the page cache) with every track you ever heard.
+    // The id is kept opaque (no suffix): the server may transcode or the suffix
+    // may be unknown offline, and mpv probes the container regardless.
     fn audio_path(&self, song_id: &str) -> PathBuf {
         self.audio_dir.join(song_id.replace('/', "_"))
     }
 
-    pub fn cached_stream(&self, song_id: &str) -> Option<PathBuf> {
-        Some(self.audio_path(song_id)).filter(|p| p.exists())
+    fn prefetch_path(&self, song_id: &str) -> PathBuf {
+        self.prefetch_dir.join(song_id.replace('/', "_"))
     }
 
-    /// Pin the ORIGINAL file for `song_id`. Idempotent. Fetches the
-    /// `download` endpoint (untranscoded) and falls back to `stream`.
+    /// An explicit download of this song exists (what the ✓ in the list means).
+    pub fn is_pinned(&self, song_id: &str) -> bool {
+        self.audio_path(song_id).exists()
+    }
+
+    /// A local file to play instead of streaming: a download, else a prefetch.
+    pub fn cached_stream(&self, song_id: &str) -> Option<PathBuf> {
+        [self.audio_path(song_id), self.prefetch_path(song_id)].into_iter().find(|p| p.exists())
+    }
+
+    /// Download for keeps. Idempotent. Promotes an already-prefetched copy with
+    /// a rename (no second download). Fetches the ORIGINAL file via `download`,
+    /// falling back to `stream`.
     pub async fn download_song(&self, song_id: &str) -> Result<PathBuf> {
         let path = self.audio_path(song_id);
         if path.exists() {
             return Ok(path);
         }
-        let bytes = match self.fetch_audio("download", song_id).await {
-            Some(b) => b,
-            None => self
-                .fetch_audio("stream", song_id)
-                .await
-                .ok_or_else(|| ApiError::Subsonic("could not download song".into()))?,
-        };
-        write_atomic(&path, &bytes).await?;
-        Ok(path)
+        let prefetched = self.prefetch_path(song_id);
+        if prefetched.exists() {
+            tokio::fs::create_dir_all(&self.audio_dir).await?;
+            if tokio::fs::rename(&prefetched, &path).await.is_ok() {
+                return Ok(path);
+            }
+        }
+        if self.fetch_audio_to("download", song_id, &path).await || self.fetch_audio_to("stream", song_id, &path).await {
+            Ok(path)
+        } else {
+            Err(ApiError::Subsonic("could not download song".into()))
+        }
     }
 
-    /// GET an audio endpoint, returning the body or `None` on any error —
-    /// including the JSON error envelope some servers send instead of a 4xx,
-    /// and a body shorter than its Content-Length (a link that drops
-    /// mid-transfer can close cleanly; pinning that would play seconds short
-    /// of the real end and "skip" near the finish).
-    async fn fetch_audio(&self, endpoint: &str, song_id: &str) -> Option<Vec<u8>> {
-        let resp = self
+    /// Fetch `song_id` into the bounded look-ahead cache, then evict old
+    /// entries. `keep` are the ids that must survive (what's playing, what's
+    /// next). Best-effort and silent.
+    pub async fn prefetch_song(&self, song_id: &str, keep: &[String]) {
+        if self.cached_stream(song_id).is_none() {
+            let path = self.prefetch_path(song_id);
+            if !(self.fetch_audio_to("download", song_id, &path).await || self.fetch_audio_to("stream", song_id, &path).await) {
+                return;
+            }
+        }
+        let keep: Vec<String> = keep.iter().map(|k| k.replace('/', "_")).collect();
+        evict_prefetch(&self.prefetch_dir, &keep, PREFETCH_HISTORY);
+    }
+
+    /// Stream an audio endpoint straight to `dest` in chunks: peak memory is one
+    /// network chunk, not the file (a 30 MB FLAC used to cost ~70 MB of RAM —
+    /// the body, then a copy of it). Fails — leaving nothing behind — on any
+    /// error, on the JSON error envelope some servers send instead of a 4xx, and
+    /// on a body shorter than its Content-Length (a link that drops mid-transfer
+    /// can close cleanly; keeping that would play seconds short of the end).
+    async fn fetch_audio_to(&self, endpoint: &str, song_id: &str, dest: &Path) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let Ok(Ok(mut resp)) = self
             .http
             .get(format!("{}/rest/{endpoint}", self.server))
             .query(&self.params(vec![p("id", song_id)]))
             .timeout(Duration::from_secs(600))
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?;
+            .map(|r| r.error_for_status())
+        else {
+            return false;
+        };
         if is_json(&resp) {
-            return None;
+            return false;
         }
         let expected = resp.content_length();
-        let bytes = resp.bytes().await.ok()?;
-        if let Some(n) = expected {
-            if bytes.len() as u64 != n {
-                return None;
+        if let Some(dir) = dest.parent() {
+            if tokio::fs::create_dir_all(dir).await.is_err() {
+                return false;
             }
         }
-        Some(bytes.to_vec())
+        let mut tmp = dest.as_os_str().to_owned();
+        tmp.push(".part");
+        let tmp = PathBuf::from(tmp);
+        let Ok(mut file) = tokio::fs::File::create(&tmp).await else { return false };
+        let mut total = 0u64;
+        let ok = loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if file.write_all(&chunk).await.is_err() {
+                        break false;
+                    }
+                    total += chunk.len() as u64;
+                }
+                Ok(None) => break expected.map_or(true, |n| n == total) && total > 0,
+                Err(_) => break false,
+            }
+        };
+        let ok = ok && file.flush().await.is_ok();
+        drop(file);
+        if ok && tokio::fs::rename(&tmp, dest).await.is_ok() {
+            true
+        } else {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            false
+        }
     }
 
     /// Drop a pinned file. Returns true if something was removed.
     #[allow(dead_code)]
     pub fn remove_pin(&self, song_id: &str) -> bool {
         std::fs::remove_file(self.audio_path(song_id)).is_ok()
+    }
+}
+
+/// How many *previously played* prefetched tracks to keep besides the ones in
+/// `keep`: enough that skipping back a track or two doesn't re-download.
+pub const PREFETCH_HISTORY: usize = 2;
+
+/// Delete look-ahead files beyond the newest `history` that aren't in `keep`
+/// (and abandoned `.part` files). Pure file-system logic, so it's testable.
+pub fn evict_prefetch(dir: &Path, keep: &[String], history: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut old: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
+        let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        if name.ends_with(".part") {
+            // an in-flight download is young; anything older was abandoned
+            if modified.elapsed().map_or(false, |d| d > Duration::from_secs(600)) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if !keep.contains(&name) {
+            old.push((modified, path));
+        }
+    }
+    old.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, path) in old.into_iter().skip(history) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -689,6 +779,50 @@ mod tests {
         c.set_quality(192, "mp3");
         let url = c.stream_url("x");
         assert!(url.contains("maxBitRate=192") && url.contains("format=mp3"));
+    }
+
+    #[test]
+    fn eviction_keeps_the_playing_and_next_tracks_plus_a_short_history() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("rustdrome-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        // ten tracks, "t0" the oldest … "t9" the newest
+        for i in 0..10u64 {
+            let f = std::fs::File::create(dir.join(format!("t{i}"))).unwrap();
+            f.set_modified(now - Duration::from_secs((10 - i) * 60)).unwrap();
+        }
+        // the user skipped back: t2 is playing, t3 is next — those must survive even though they're old
+        evict_prefetch(&dir, &["t2".into(), "t3".into()], 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, vec!["t2", "t3", "t8", "t9"], "keep + the 2 newest others; everything else gone");
+        // a fresh .part (a download in flight) is left alone, an abandoned one is removed
+        let fresh = dir.join("t10.part");
+        std::fs::File::create(&fresh).unwrap();
+        let stale = dir.join("t11.part");
+        std::fs::File::create(&stale).unwrap().set_modified(now - Duration::from_secs(3600)).unwrap();
+        evict_prefetch(&dir, &[], 4);
+        assert!(fresh.exists() && !stale.exists());
+        // a missing directory is not an error
+        evict_prefetch(&dir.join("nope"), &[], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn downloads_and_prefetches_live_in_separate_places() {
+        let dir = std::env::temp_dir().join(format!("rustdrome-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = SubsonicClient::new("http://h:1", "u", "t", "s", dir.join("art"), dir.join("audio"), 0, "");
+        std::fs::create_dir_all(dir.join("audio-cache")).unwrap();
+        std::fs::write(dir.join("audio-cache/p1"), b"x").unwrap();
+        assert!(c.cached_stream("p1").is_some(), "a prefetched file is playable…");
+        assert!(!c.is_pinned("p1"), "…but is not a download (no ✓, and it may be evicted)");
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        std::fs::write(dir.join("audio/d1"), b"x").unwrap();
+        assert!(c.is_pinned("d1") && c.cached_stream("d1").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

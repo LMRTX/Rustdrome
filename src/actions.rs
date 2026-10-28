@@ -1,6 +1,7 @@
 //! Everything the app *does*: playback, queue edits, library loading,
 //! playlists, downloads. Ported action-for-action from `app.py`.
 
+use crossterm::event::KeyEvent;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::app::*;
+use crate::dock::{Dir, Dock, PanelId, Zone};
 use crate::keys::Action;
 use crate::modal::*;
 use crate::models::*;
@@ -68,6 +70,9 @@ pub const COMMANDS: &[(&str, Action)] = &[
     ("cycle theme", Action::ThemeCycle),
     ("pick theme", Action::ThemePick),
     ("square / rounded boxes", Action::BorderStyle),
+    ("layouts…", Action::LayoutMenu),
+    ("arrange panels (keyboard)", Action::LayoutEdit),
+    ("reset layout", Action::LayoutReset),
     ("zen splash", Action::Zen),
     ("help", Action::Help),
     ("quit", Action::Quit),
@@ -302,6 +307,13 @@ impl App {
                 self.square = !self.square;
                 self.dirs.save_state(serde_json::json!({ "border_style": if self.square { "square" } else { "rounded" } }));
                 self.info(if self.square { "square boxes" } else { "rounded boxes" });
+            }
+            LayoutMenu => self.layout_menu(),
+            LayoutEdit => self.enter_arrange(),
+            LayoutReset => {
+                if self.try_dock(Dock::classic(), "the classic layout") {
+                    self.info("layout reset");
+                }
             }
             Zen => self.zen = !self.zen,
             PrivateMode => {
@@ -877,6 +889,7 @@ impl App {
         self.persist_queue(Some(resume_at));
         self.announce_track(&song);
         self.prefetch_next();
+        self.prefetch_art();
     }
 
     pub fn action_play_pause(&mut self) {
@@ -1215,16 +1228,69 @@ impl App {
         if self.art.as_ref().is_some_and(|(id, _)| *id == cover_id) {
             return;
         }
+        // prepared ahead of time while the previous track played: instant
+        if let Some(p) = self.art_lru.take(&cover_id) {
+            self.apply_prepared(cover_id, p);
+            return;
+        }
         let Some(c) = self.client.clone() else { return };
-        let tx = self.tx.clone();
+        let (tx, hint) = (self.tx.clone(), self.encode_hint());
         self.spawn(async move {
             if let Ok(path) = c.cover_art(&cover_id, crate::art::SERVER_SIZE).await {
                 // decoding a JPEG takes tens of ms — never on the UI thread
-                let p = path.clone();
-                if let Some(small) = tokio::task::spawn_blocking(move || crate::art::load(&p)).await.ok().flatten() {
-                    App::send(&tx, Msg::Art { cover_id, path, small });
+                if let Some(prepared) = tokio::task::spawn_blocking(move || crate::art::prepare(&path, hint.as_ref())).await.ok().flatten() {
+                    App::send(&tx, Msg::Art { cover_id, prepared });
                 }
             }
+        });
+    }
+
+    /// The sixel layout to pre-encode for, if sixel is in use and the panel's size is known.
+    fn encode_hint(&self) -> Option<(crate::sixel::Plan, (u16, u16))> {
+        (self.art_mode == crate::art::ArtMode::Sixel).then_some(self.sixel.plan_hint).flatten()
+    }
+
+    /// Make a prepared cover the current one.
+    pub fn apply_prepared(&mut self, cover: String, p: crate::art::Prepared) {
+        self.tint = self.settings.art_theming.then_some(p.tint).flatten();
+        self.art = Some((cover.clone(), crate::art::Art::new(p.small)));
+        self.art_path = Some(p.path);
+        if let Some((key, enc)) = p.enc {
+            // used only if the panel still has this shape; otherwise `ensure_sixel` re-encodes
+            self.sixel.cache = Some((cover, key, enc));
+        }
+    }
+
+    /// A cover finished preparing: show it if it's the current song's, else keep it for later.
+    pub fn art_arrived(&mut self, cover: String, p: crate::art::Prepared) {
+        if self.now_song.as_ref().and_then(|s| s.cover_art.as_deref()) == Some(cover.as_str()) {
+            self.apply_prepared(cover, p);
+        } else {
+            self.art_lru.insert(cover, p);
+        }
+    }
+
+    /// Prepare the NEXT track's cover while this one plays — fetched, decoded
+    /// once, and (for sixel) already encoded for the current panel size — so
+    /// that when the track changes the picture is there on the first frame.
+    pub fn prefetch_art(&mut self) {
+        if self.art_mode == crate::art::ArtMode::Off || self.offline {
+            return;
+        }
+        let Some(c) = self.client.clone() else { return };
+        let Some(cover) = self.queue.peek_next().and_then(|s| s.cover_art.clone()) else { return };
+        let current = self.now_song.as_ref().and_then(|s| s.cover_art.as_deref());
+        if current == Some(cover.as_str()) || self.art_lru.contains(&cover) || self.art_prefetching.as_deref() == Some(cover.as_str()) {
+            return;
+        }
+        self.art_prefetching = Some(cover.clone());
+        let (tx, hint) = (self.tx.clone(), self.encode_hint());
+        self.spawn(async move {
+            let mut prepared = None;
+            if let Ok(path) = c.cover_art(&cover, crate::art::SERVER_SIZE).await {
+                prepared = tokio::task::spawn_blocking(move || crate::art::prepare(&path, hint.as_ref())).await.ok().flatten();
+            }
+            App::send(&tx, Msg::ArtPrefetched { cover, prepared }); // also clears the in-flight flag on failure
         });
     }
 
@@ -1306,7 +1372,7 @@ impl App {
         };
         if song.stream_url.is_some() {
             self.info("internet radio can't be downloaded");
-        } else if self.client.as_ref().is_some_and(|c| c.cached_stream(&song.id).is_some()) {
+        } else if self.client.as_ref().is_some_and(|c| c.is_pinned(&song.id)) {
             self.info(format!("already downloaded: {}", song.title));
         } else {
             let label = song.title.clone();
@@ -1316,7 +1382,7 @@ impl App {
 
     pub fn download_songs(&mut self, songs: Vec<Song>, label: String) {
         let Some(c) = self.client.clone() else { return };
-        let pending: Vec<Song> = songs.into_iter().filter(|s| s.stream_url.is_none() && c.cached_stream(&s.id).is_none()).collect();
+        let pending: Vec<Song> = songs.into_iter().filter(|s| s.stream_url.is_none() && !c.is_pinned(&s.id)).collect();
         if pending.is_empty() {
             self.info(format!("{label}: already downloaded"));
             return;
@@ -1337,8 +1403,8 @@ impl App {
         });
     }
 
-    /// Warm the next queued track so its start is instant. Pins to the audio
-    /// cache (so it's also available offline); silent and best-effort.
+    /// Warm the next queued track so its start is instant. Goes to the bounded
+    /// look-ahead cache (not your downloads); silent and best-effort.
     fn prefetch_next(&mut self) {
         let Some(c) = self.client.clone() else { return };
         if self.offline {
@@ -1349,12 +1415,16 @@ impl App {
         if Some(&next.id) == cur.as_ref() || next.stream_url.is_some() {
             return;
         }
-        if self.prefetched.as_deref() == Some(next.id.as_str()) || c.cached_stream(&next.id).is_some() {
+        // once per (playing, next) pair — and it also runs eviction, so the
+        // look-ahead cache stays bounded however long you listen
+        let pair = format!("{}>{}", cur.as_deref().unwrap_or(""), next.id);
+        if self.prefetched.as_deref() == Some(pair.as_str()) {
             return;
         }
-        self.prefetched = Some(next.id.clone());
+        self.prefetched = Some(pair);
+        let keep: Vec<String> = cur.into_iter().chain([next.id.clone()]).collect();
         self.spawn(async move {
-            let _ = c.download_song(&next.id).await;
+            c.prefetch_song(&next.id, &keep).await;
         });
     }
 
@@ -1364,6 +1434,123 @@ impl App {
         }
         let art = song.cover_art.as_ref().and_then(|c| self.client.as_ref()?.cached_art(c, crate::art::SERVER_SIZE));
         crate::clipboard::desktop_notify(&song.title, &format!("{} · {}", song.artist, song.album), art);
+    }
+
+    // ── layout ────────────────────────────────────────────────────────
+    pub fn save_dock(&mut self) {
+        self.dirs.save_state(serde_json::json!({ "ui_dock": self.dock.to_json() }));
+    }
+
+    /// Switch to `new` if it fits this terminal. A layout that needs more room
+    /// than there is would leave only the "too small" screen — with no way to
+    /// see the menu that undoes it — so it is refused with the size it needs.
+    pub fn try_dock(&mut self, new: Dock, what: &str) -> bool {
+        let (w, h) = new.min_size();
+        let m = self.rects.main;
+        if m.width > 0 && (w > m.width || h > m.height) {
+            self.notify(
+                format!("{what} needs at least {}×{} — this terminal is {}×{}", w, h + 6, m.width, m.height + 6),
+                Level::Warn,
+            );
+            return false;
+        }
+        self.dock = new;
+        self.save_dock();
+        true
+    }
+
+    /// A panel carried with the mouse was dropped at `mv.x, mv.y`.
+    pub fn finish_move(&mut self, mv: Moving) {
+        let arr = self.rects.arranged.clone();
+        let Some(target) = arr.panel_at(mv.x, mv.y).filter(|t| *t != mv.panel) else { return };
+        let Some(r) = arr.rect(target) else { return };
+        let mut d = self.dock.clone();
+        if d.move_panel(mv.panel, target, crate::dock::zone_at(r, mv.x, mv.y)) && self.try_dock(d, "that layout") {
+            self.info(format!("moved {}", mv.panel.label()));
+        }
+    }
+
+    pub fn enter_arrange(&mut self) {
+        if self.zen {
+            return;
+        }
+        self.arrange = Some(match self.focus {
+            Focus::Sidebar => PanelId::Library,
+            Focus::Tracks => PanelId::Tracks,
+            Focus::Queue => PanelId::Queue,
+        });
+    }
+
+    /// Keyboard arrange mode: arrows swap the selected panel with its neighbour
+    /// in that direction, shift+arrows dock it beside that neighbour instead.
+    /// Returns whether the key was consumed.
+    pub fn on_arrange_key(&mut self, sel: PanelId, k: &KeyEvent) -> bool {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let dir = match k.code {
+            K::Left => Some(Dir::Left),
+            K::Right => Some(Dir::Right),
+            K::Up => Some(Dir::Up),
+            K::Down => Some(Dir::Down),
+            _ => None,
+        };
+        match (k.code, dir) {
+            (K::Esc | K::Enter, _) => self.arrange = None,
+            (K::Tab | K::BackTab, _) => {
+                let mut order: Vec<(u16, u16, PanelId)> = self.rects.arranged.panels.iter().map(|(p, r)| (r.x, r.y, *p)).collect();
+                order.sort_by_key(|(x, y, _)| (*x, *y));
+                if let Some(i) = order.iter().position(|(_, _, p)| *p == sel) {
+                    let step = if k.code == K::Tab { 1 } else { order.len() - 1 };
+                    self.arrange = Some(order[(i + step) % order.len()].2);
+                }
+            }
+            (K::Char('r'), _) => {
+                if self.try_dock(Dock::classic(), "the classic layout") {
+                    self.info("layout reset");
+                }
+            }
+            (_, Some(dir)) => {
+                let Some(n) = self.rects.arranged.neighbor(sel, dir) else { return true };
+                let zone = if k.modifiers.contains(M::SHIFT) {
+                    match dir {
+                        Dir::Left => Zone::Left,
+                        Dir::Right => Zone::Right,
+                        Dir::Up => Zone::Top,
+                        Dir::Down => Zone::Bottom,
+                    }
+                } else {
+                    Zone::Swap
+                };
+                let mut d = self.dock.clone();
+                if d.move_panel(sel, n, zone) {
+                    self.try_dock(d, "that layout");
+                }
+            }
+            // let the quit key through so you can never get stuck here
+            _ => return !matches!(self.keymap.resolve(k), Some(Action::Quit)),
+        }
+        true
+    }
+
+    /// The picker of presets, saved layouts, and "save current…".
+    pub fn layout_menu(&mut self) {
+        let mut items = vec!["＋ save current layout…".to_string()];
+        let mut choices = vec![LayoutChoice::SaveCurrent];
+        for (name, d) in Dock::presets() {
+            items.push(name.to_string());
+            choices.push(LayoutChoice::Apply(d));
+        }
+        let state = self.dirs.load_state();
+        if let Some(saved) = state.get("ui_layouts").and_then(|v| v.as_object()) {
+            let mut names: Vec<&String> = saved.keys().collect();
+            names.sort();
+            for n in names {
+                if let Some(d) = Dock::from_json(&saved[n]) {
+                    items.push(format!("★ {n}"));
+                    choices.push(LayoutChoice::Apply(d));
+                }
+            }
+        }
+        self.modal = Some(Modal::Picker(Picker::new("layouts", items, PickKind::Layout(choices), false)));
     }
 
     // ── playlists ─────────────────────────────────────────────────────
@@ -1464,6 +1651,14 @@ impl App {
     }
 
     pub fn on_input(&mut self, purpose: InputPurpose, text: String) {
+        if matches!(purpose, InputPurpose::SaveLayout) {
+            // saved layouts live beside the other UI state; same name overwrites
+            let mut saved = self.dirs.load_state().get("ui_layouts").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+            saved.insert(text.clone(), self.dock.to_json());
+            self.dirs.save_state(serde_json::json!({ "ui_layouts": saved }));
+            self.info(format!("saved layout “{text}”"));
+            return;
+        }
         let Some(c) = self.client.clone() else { return };
         let tx = self.tx.clone();
         match purpose {
@@ -1491,6 +1686,7 @@ impl App {
                     }
                 });
             }
+            InputPurpose::SaveLayout => {}
             InputPurpose::RenamePlaylist(id) => {
                 self.spawn(async move {
                     match c.rename_playlist(&id, &text).await {

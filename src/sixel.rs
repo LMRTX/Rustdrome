@@ -181,10 +181,14 @@ pub struct Encoded {
 /// Decode `path`, fit it inside `plan.side`, quantise, and encode it centred on
 /// the plan's canvas. Blocking — run it off the UI thread.
 pub fn encode_file(path: &std::path::Path, plan: &Plan, cell: (u16, u16)) -> Option<Encoded> {
-    // cached covers have no file extension, so sniff the format from content
-    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.to_rgb8();
+    Some(encode_image(&crate::art::decode(path)?, plan, cell))
+}
+
+/// Encode an already-decoded cover for `plan` (so a caller that has the pixels
+/// doesn't decode the file again).
+pub fn encode_image(img: &RgbImage, plan: &Plan, cell: (u16, u16)) -> Encoded {
     let (cw, ch) = (plan.key.cols as u32 * cell.0.max(1) as u32, plan.key.rows as u32 * cell.1.max(1) as u32);
-    Some(encode_canvas(&fit(&img, plan.key.side), cw, ch, PALETTE))
+    encode_canvas(&fit(img, plan.key.side), cw, ch, PALETTE)
 }
 
 fn fit(img: &RgbImage, side: u32) -> RgbImage {
@@ -225,19 +229,26 @@ fn quantize(img: &RgbImage, max: usize) -> (Vec<[u8; 3]>, Vec<u8>) {
     if exact {
         return (palette, idx);
     }
-    let rgba: Vec<u8> = img.pixels().flat_map(|p| [p.0[0], p.0[1], p.0[2], 255]).collect();
-    // NeuQuant trains on 1 in `factor` pixels. Measured (release, 360×360
-    // artwork): factor 1 = 86 ms / mean error 3.4, factor 10 = 18 ms / 3.8; on
-    // small images the gap is wider (4.6 vs 6.8). It runs once per cover on a
-    // background thread, so spend the milliseconds — but back off for very
-    // large images, where the extra training buys little.
-    let factor = if rgba.len() / 4 <= 200_000 { 1 } else { 3 };
-    let nq = NeuQuant::new(factor, max, &rgba);
+    // The palette only needs the image's colour *distribution*, which a
+    // thumbnail has just as well as the full picture. Training NeuQuant on every
+    // pixel was most of the encode time (≈90 ms of ≈100 at 360 px); training on
+    // ≤160 px costs a few milliseconds and picks a palette of the same quality.
+    let train = if img.width().max(img.height()) > TRAIN_EDGE {
+        let s = TRAIN_EDGE as f64 / img.width().max(img.height()) as f64;
+        image::imageops::thumbnail(img, ((img.width() as f64 * s).round() as u32).max(1), ((img.height() as f64 * s).round() as u32).max(1))
+    } else {
+        img.clone()
+    };
+    let rgba: Vec<u8> = train.pixels().flat_map(|p| [p.0[0], p.0[1], p.0[2], 255]).collect();
+    let nq = NeuQuant::new(1, max, &rgba);
     let map = nq.color_map_rgba();
     let palette: Vec<[u8; 3]> = map.chunks_exact(4).map(|c| [c[0], c[1], c[2]]).collect();
     let idx = dither(img, &nq, &palette);
     (palette, idx)
 }
+
+/// Longest edge of the thumbnail the palette is trained on.
+const TRAIN_EDGE: u32 = 160;
 
 /// Floyd–Steinberg error diffusion (serpentine scan) against the palette.
 /// A palette of 256 across a smooth gradient shows hard contour bands;
@@ -246,6 +257,12 @@ fn quantize(img: &RgbImage, max: usize) -> (Vec<[u8; 3]>, Vec<u8>) {
 fn dither(img: &RgbImage, nq: &NeuQuant, palette: &[[u8; 3]]) -> Vec<u8> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = vec![0u8; w * h];
+    // Nearest-palette lookups are the hot loop (one per pixel). Colours repeat
+    // endlessly, so memoise them on a 6-bit-per-channel grid (256 K entries,
+    // 512 KB, freed when the encode ends): tens of thousands of real searches
+    // instead of hundreds of thousands. (5 bits was faster still but visibly
+    // grainier.) The error diffusion below corrects for the grid's coarseness.
+    let mut lut = vec![u16::MAX; 1 << 18];
     // error rows in 1/16ths, padded by one cell each side
     let mut cur = vec![[0i32; 3]; w + 2];
     let mut next = vec![[0i32; 3]; w + 2];
@@ -259,7 +276,17 @@ fn dither(img: &RgbImage, nq: &NeuQuant, palette: &[[u8; 3]]) -> Vec<u8> {
             for k in 0..3 {
                 px[k] = (src[k] as i32 + cur[x + 1][k] / 16).clamp(0, 255) as u8;
             }
-            let i = nq.index_of(&px);
+            let cell = ((px[0] as usize >> 2) << 12) | ((px[1] as usize >> 2) << 6) | (px[2] as usize >> 2);
+            let i = match lut[cell] {
+                u16::MAX => {
+                    // search with the middle of the grid cell, not the pixel itself
+                    let probe = [(px[0] & 0xFC) | 2, (px[1] & 0xFC) | 2, (px[2] & 0xFC) | 2, 255];
+                    let i = nq.index_of(&probe);
+                    lut[cell] = i as u16;
+                    i
+                }
+                known => known as usize,
+            };
             out[y * w + x] = i as u8;
             let chosen = palette[i];
             for k in 0..3 {
@@ -391,6 +418,9 @@ pub struct SixelState {
     pub want: Option<(String, Plan)>,
     /// set by `draw` each frame: the art panel's area (even with no image)
     pub area_now: Option<Rect>,
+    /// the plan for the panel as last laid out (kept across frames), so covers
+    /// prepared in the background can pre-encode for it
+    pub plan_hint: Option<(Plan, (u16, u16))>,
     /// set by `draw` each frame: what should be visible right now
     pub show: Option<Shown>,
     /// what we last wrote to the terminal
@@ -400,13 +430,13 @@ pub struct SixelState {
 use crate::app::{App, Msg};
 
 impl App {
-    /// The layout is still changing — a divider is being dragged, or the
+    /// The layout is still changing — a divider is being dragged, a panel is being moved, or the
     /// window / font was just resized and the cell size hasn't been re-read
     /// yet. No image is planned or shown meanwhile: a plan made with a stale
     /// cell size is the wrong size by definition, and encoding it only gets in
     /// the way of the right one.
     pub fn settling(&self) -> bool {
-        self.drag.is_some() || self.resize_at.is_some()
+        self.drag.is_some() || self.moving.is_some() || self.resize_at.is_some()
     }
 
     /// Kick off a background encode if the panel wants an image we don't have.

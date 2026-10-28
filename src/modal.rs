@@ -103,6 +103,7 @@ impl Login {
 #[derive(Debug, Clone)]
 pub enum InputPurpose {
     NewPlaylist(Vec<Song>),
+    SaveLayout,
     RenamePlaylist(String),
     SaveQueue,
 }
@@ -229,8 +230,16 @@ impl LyricsModal {
 }
 
 // ── pickers ───────────────────────────────────────────────────────────
+/// One row of the layouts picker.
+#[derive(Clone)]
+pub enum LayoutChoice {
+    SaveCurrent,
+    Apply(crate::dock::Dock),
+}
+
 #[derive(Clone)]
 pub enum PickKind {
+    Layout(Vec<LayoutChoice>),
     Theme { original: String },
     Genre,
     Bookmark(Vec<Bookmark>),

@@ -240,6 +240,8 @@ pub const KEYBINDS: &[(&str, &str)] = &[
     ("theme_cycle", "t"),
     ("theme_pick", "T"),
     ("border_style", "B"),
+    ("layout_menu", "ctrl+l"),
+    ("layout_edit", "ctrl+e"),
     ("zen", "z"),
     ("private_mode", "ctrl+y"),
     ("command_palette", "ctrl+p"),

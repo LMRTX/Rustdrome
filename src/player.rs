@@ -39,8 +39,6 @@ struct Shared {
     duration: f64,
     paused: bool,
     want_playing: bool,
-    level: f64,
-    level_ok: bool,
     url: Option<String>,
     /// one resume attempt is armed per `play()`
     retried: bool,
@@ -218,14 +216,10 @@ impl Player {
 
         let shared = Arc::new(Mutex::new(Shared { paused: true, ..Default::default() }));
 
-        // observe what the UI needs, and attach an ebur128 loudness meter so
-        // the visualizer can pump with real audio. If lavfi/ebur128 is
-        // unavailable mpv just errors the command and the level stays 0.
+        // observe what the UI needs
         let _ = tx.send(cmd(&["observe_property".into(), json!(1), "time-pos".into()]));
         let _ = tx.send(cmd(&["observe_property".into(), json!(2), "duration".into()]));
         let _ = tx.send(cmd(&["observe_property".into(), json!(3), "pause".into()]));
-        let _ = tx.send(cmd(&["af".into(), "add".into(), "@nav:lavfi=[ebur128=metadata=1]".into()]));
-        let _ = tx.send(cmd(&["observe_property".into(), json!(4), "af-metadata/nav".into()]));
 
         let sh = shared.clone();
         let tx2 = tx.clone();
@@ -300,7 +294,6 @@ impl Player {
             s.want_playing = false;
             s.position = 0.0;
             s.duration = 0.0;
-            s.level = 0.0;
             s.paused = true;
         }
         self.send(&["stop".into()]);
@@ -331,13 +324,6 @@ impl Player {
 
     pub fn duration(&self) -> f64 {
         self.shared.lock().unwrap().duration
-    }
-
-    /// Live audio loudness in ~0..1, or `None` when no real signal is
-    /// available (meter unsupported / nothing playing).
-    pub fn level(&self) -> Option<f64> {
-        let s = self.shared.lock().unwrap();
-        (s.level_ok && s.want_playing).then_some(s.level)
     }
 
     pub fn seek(&self, seconds: f64) {
@@ -427,17 +413,6 @@ fn handle_mpv_message(
                 "pause" => {
                     if let Some(p) = data.and_then(Value::as_bool) {
                         s.paused = p;
-                    }
-                }
-                "af-metadata/nav" => {
-                    let lufs = data
-                        .and_then(|d| d.get("lavfi.r128.M"))
-                        .and_then(|m| m.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| m.as_f64()));
-                    if let Some(l) = lufs {
-                        // ebur128 M ranges roughly -70 (silence) .. 0 LUFS; map
-                        // the useful -50..-5 band onto 0..1
-                        s.level = ((l + 50.0) / 45.0).clamp(0.0, 1.0);
-                        s.level_ok = true;
                     }
                 }
                 _ => {}
@@ -567,18 +542,6 @@ mod tests {
         assert!(cm[0].contains("seek") && cm[0].contains("42"));
         let (_, cm) = feed(&sh, &[r#"{"event":"file-loaded"}"#]);
         assert!(cm.is_empty(), "pending start is consumed once");
-    }
-
-    #[test]
-    fn loudness_maps_onto_unit_range() {
-        let sh = playing(10.0, 0.0);
-        feed(
-            &sh,
-            &[r#"{"event":"property-change","name":"af-metadata/nav","data":{"lavfi.r128.M":"-27.5"}}"#],
-        );
-        let s = sh.lock().unwrap();
-        assert!(s.level_ok);
-        assert!((s.level - 0.5).abs() < 1e-9);
     }
 
     #[test]

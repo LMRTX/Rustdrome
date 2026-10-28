@@ -8,6 +8,7 @@ mod app;
 mod art;
 mod clipboard;
 mod config;
+mod dock;
 mod input;
 mod keys;
 mod mem;
@@ -125,6 +126,8 @@ async fn run(
             sixel::sync(app, terminal)?;
         }
         sixel::end_frame(terminal)?;
+        // start any encode this frame asked for now, not on the next 125ms tick
+        app.ensure_sixel();
         tokio::select! {
             ev = input.rx.recv() => match ev {
                 Some(Event::Key(k)) => app.on_key(k),
