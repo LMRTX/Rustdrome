@@ -250,7 +250,6 @@ Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
 - **Persistence:** configuration, application state, queue data, and caches are stored locally.
 - **Offline synchronization:** supported mutations are queued locally and synced when the server becomes available again.
 
-
 ## License
 
 **[GPL-3.0-or-later](https://www.gnu.org/licenses/gpl-3.0.html)**
