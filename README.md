@@ -50,7 +50,8 @@ sudo apt install mpv
 sudo dnf install mpv
 ```
 
-**Windows 11**
+
+**Windows**
 
 **[Github releases page](https://github.com/mpv-player/mpv/releases)**
 
