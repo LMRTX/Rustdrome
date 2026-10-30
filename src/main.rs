@@ -9,6 +9,7 @@ mod art;
 mod clipboard;
 mod config;
 mod dock;
+mod hangup;
 mod input;
 mod keys;
 mod mem;
@@ -66,6 +67,8 @@ fn main() -> Result<()> {
 async fn real_main() -> Result<()> {
     let dirs = AppDirs::new();
     let settings = Settings::load(dirs.config_dir());
+    // before anything is started: a closed terminal must reach us as an orderly quit, not a kill
+    let mut gone = hangup::Hangup::new();
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let (ptx, mut prx) = unbounded_channel();
 
@@ -96,7 +99,7 @@ async fn real_main() -> Result<()> {
     app.start();
 
     let mut input = input::Input::spawn();
-    let result = run(&mut terminal, &mut app, &mut rx, &mut prx, &mut input).await;
+    let result = run(&mut terminal, &mut app, &mut rx, &mut prx, &mut input, &mut gone).await;
     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2026l"); // never leave the display held
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -109,38 +112,32 @@ async fn run(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     prx: &mut player::PlayerEvents,
     input: &mut input::Input,
+    gone: &mut hangup::Hangup,
 ) -> Result<()> {
     // the one shared 8fps heartbeat that drives every animation
     let mut beat = tokio::time::interval(Duration::from_millis(125));
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !app.quit {
-        // one synchronized update per step: a resize's screen clear and the
-        // repaint that follows are presented together, never the blank between
-        sixel::begin_frame(terminal)?;
-        terminal.draw(|f| ui::draw(f, app))?;
-        // `true` means the screen was cleared (the art panel had moved): repaint
-        // right now, in the same step, rather than leaving it blank until the next tick
-        if sixel::sync(app, terminal)? {
-            terminal.draw(|f| ui::draw(f, app))?;
-            sixel::sync(app, terminal)?;
-        }
-        sixel::end_frame(terminal)?;
-        // start any encode this frame asked for now, not on the next 125ms tick
-        app.ensure_sixel();
+        draw_step(terminal, app)?;
         tokio::select! {
             ev = input.rx.recv() => match ev {
-                Some(Event::Key(k)) => app.on_key(k),
-                Some(Event::Mouse(m)) => app.on_mouse(m),
-                // ratatui clears the screen on resize, which wipes any sixel; the
-                // cell size may have changed too (font zoom, another monitor)
-                Some(Event::Resize(..)) => {
-                    app.sixel.shown = None;
-                    if app.art_mode == art::ArtMode::Sixel {
-                        app.resize_at = Some(std::time::Instant::now());
+                Some(ev) => {
+                    handle_event(app, ev);
+                    // A drag or a window resize delivers events faster than a
+                    // frame (and, with a picture, a sixel) can be drawn. Apply
+                    // everything already queued and draw once, so the picture
+                    // follows the pointer instead of lagging behind a backlog.
+                    for _ in 0..256 {
+                        if app.quit {
+                            break;
+                        }
+                        match input.rx.try_recv() {
+                            Ok(ev) => handle_event(app, ev),
+                            Err(_) => break,
+                        }
                     }
                 }
-                Some(_) => {}
                 None => break,
             },
             _ = beat.tick() => {
@@ -149,6 +146,8 @@ async fn run(
             }
             Some(m) = rx.recv() => app.on_msg(m),
             Some(e) = prx.recv() => app.on_player_event(e),
+            // terminal closed / SIGTERM: leave through the normal path so mpv is stopped
+            _ = gone.recv() => break,
         }
         // drain anything else that's already queued so a burst costs one redraw
         while let Ok(m) = rx.try_recv() {
@@ -156,5 +155,43 @@ async fn run(
         }
     }
     app.shutdown();
+    Ok(())
+}
+
+fn handle_event(app: &mut App, ev: Event) {
+    match ev {
+        Event::Key(k) => app.on_key(k),
+        Event::Mouse(m) => app.on_mouse(m),
+        // ratatui clears the screen on resize, which wipes any sixel; the
+        // cell size may have changed too (font zoom, another monitor)
+        Event::Resize(..) => app.on_resize(),
+        _ => {}
+    }
+}
+
+/// One frame: draw, put the cover on top, all inside one synchronized update
+/// (DEC 2026) so a resize's screen clear, the repaint and the picture are
+/// presented together — never the blank between.
+fn draw_step(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+    // ratatui wipes the screen when the terminal's size differs from the last
+    // frame's, and with it any picture; a Resize event at an unchanged size
+    // (they come in duplicates) wipes nothing, so only a real change forgets it
+    let (now, last) = (terminal.size()?, terminal.get_frame().area());
+    if (now.width, now.height) != (last.width, last.height) {
+        app.sixel.shown = None;
+    }
+    sixel::begin_frame(terminal)?;
+    let done = terminal.draw(|f| ui::draw(f, app))?;
+    sixel::note_frame(app, done.buffer);
+    // `true` means the screen was cleared (the art panel had moved): repaint
+    // right now, in the same step, rather than leaving it blank until the next tick
+    if sixel::sync(app, terminal)? {
+        let done = terminal.draw(|f| ui::draw(f, app))?;
+        sixel::note_frame(app, done.buffer);
+        sixel::sync(app, terminal)?;
+    }
+    sixel::end_frame(terminal)?;
+    // start any encode this frame asked for now, not on the next 125ms tick
+    app.ensure_sixel();
     Ok(())
 }

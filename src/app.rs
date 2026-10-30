@@ -175,6 +175,9 @@ pub struct App {
     pub cell_probe_ok: bool,
     pub resize_at: Option<Instant>,
     pub win_sig: Option<(u16, u16, u16, u16)>,
+    /// the window changed in a way that may have changed the cell size (font zoom,
+    /// DPI): re-read it exactly once the window settles
+    pub cell_stale: bool,
 
     // engine
     pub player: Player,
@@ -326,6 +329,7 @@ impl App {
             cell_probe_ok: false,
             resize_at: None,
             win_sig: None,
+            cell_stale: false,
             player: Player::null(),
             queue,
             now_song,

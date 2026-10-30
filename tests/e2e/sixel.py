@@ -61,7 +61,11 @@ try:
     check("leaving zen restores the panel image", delta(t, "z", 2.5) == 1)
     fcntl.ioctl(t.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0)); os.kill(t.pid, signal.SIGWINCH)
     t.screen.resize(30, 120); n = len(sixel_blobs(t.raw)); t.pump(2.5)
-    check("resizing the terminal re-sends it at the new size", len(sixel_blobs(t.raw)) == n + 1)
+    new = sixel_blobs(t.raw)[n:]
+    # a quick preview is sent straight away (no blank while the real encode runs), then the real one replaces it
+    check("resizing sends a preview at once and the quality encode after it", len(new) == 2)
+    sizes = [sixel_to_image(b[1]).size for b in new]
+    check("…both at the new size, in the same place", len(new) == 2 and sizes[0] == sizes[1] and new[0][0] == new[1][0])
     t.close()
 
     for label, probe, env, expect in [

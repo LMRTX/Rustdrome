@@ -527,20 +527,37 @@ fn draw_art(f: &mut Frame, app: &mut App, area: Rect, th: &Theme, bordered: bool
         if !app.settling() {
             app.sixel.plan_hint = crate::sixel::plan(inner, app.cell_px).map(|p| (p, app.cell_px));
         }
-        // while the layout is still changing (divider drag, zoom, window resize)
-        // show nothing until it settles, then encode once at the right size
-        if let (true, Some(cover), false) = (ready, cover, app.settling()) {
+        // A picture is never withdrawn just because its panel is changing size:
+        //  * while a divider is dragged or the window resized, a quick
+        //    approximation is encoded for each new size (a few ms) so the cover
+        //    follows the panel; no quality encode is started meanwhile;
+        //  * once things settle the quality encode is requested, and the
+        //    approximation stays up until it lands — then it is painted over.
+        // Only a panel being carried around (`moving`) still hides it.
+        if let (true, Some(cover)) = (ready && app.moving.is_none(), cover) {
             if let Some(plan) = crate::sixel::plan(inner, app.cell_px) {
-                app.sixel.want = Some((cover.clone(), plan));
-                if let Some((c, k, _)) = &app.sixel.cache {
-                    if *c == cover && *k == plan.key {
-                        app.sixel.show = Some(crate::sixel::Shown {
-                            rect: plan.rect,
-                            cover,
-                            key: plan.key,
-                            theme: app.theme_name.clone(),
-                            area: inner,
-                        });
+                let theme = app.theme_name.clone();
+                let shown = |preview| crate::sixel::Shown { rect: plan.rect, cover: cover.clone(), key: plan.key, theme: theme.clone(), area: inner, preview };
+                let have_preview = matches!(&app.sixel.preview, Some((c, k, _)) if *c == cover && *k == plan.key);
+                let have_real = matches!(&app.sixel.cache, Some((c, k, _)) if *c == cover && *k == plan.key);
+                if app.live_resize() && have_real {
+                    // the panel's size hasn't changed (a drag just started, or this step
+                    // landed on the same size): keep the good picture, don't downgrade it
+                    app.sixel.show = Some(shown(false));
+                } else if app.live_resize() {
+                    if !have_preview {
+                        if let Some((_, art)) = &app.art {
+                            let enc = crate::sixel::encode_preview(art.source(), &plan, app.cell_px);
+                            app.sixel.preview = Some((cover.clone(), plan.key, enc));
+                        }
+                    }
+                    app.sixel.show = Some(shown(true));
+                } else {
+                    app.sixel.want = Some((cover.clone(), plan));
+                    if have_real {
+                        app.sixel.show = Some(shown(false));
+                    } else if have_preview {
+                        app.sixel.show = Some(shown(true)); // keep the approximation until the real one lands
                     }
                 }
             }
@@ -1107,7 +1124,15 @@ mod tests {
     use ratatui::Terminal;
 
     fn test_app(mode: ArtMode) -> App {
-        let tmp = std::env::temp_dir().join(format!("rustdrome-ui-{}", std::process::id()));
+        // one empty directory per app: tests persist layouts via `save_dock`, so a directory
+        // shared by pid would leak one test's saved dock into another's starting state
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "rustdrome-ui-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(AppDirs::under(&tmp), Settings::default(), tx);
         app.zen = true;
@@ -1630,5 +1655,108 @@ mod tests {
         assert!(p.items.iter().any(|i| i == "★ my setup"));
         let LayoutChoice::Apply(saved) = choices.last().unwrap() else { panic!() };
         assert_eq!(*saved, crate::dock::Dock::presets()[1].1);
+    }
+
+    /// the Sixel test app in the classic (non-zen) layout, with a cover that is ready to draw
+    fn classic_sixel_app() -> App {
+        let mut app = test_app(ArtMode::Sixel);
+        app.zen = false;
+        app
+    }
+
+    #[test]
+    fn a_resize_shows_a_preview_where_it_used_to_show_nothing() {
+        let mut app = classic_sixel_app();
+        let _ = render(&mut app, 140, 40);
+        assert!(app.sixel.want.is_some() && app.sixel.show.is_none(), "settled, nothing encoded yet: wants the real one, shows nothing");
+        let settled = app.sixel.want.clone().unwrap().1;
+
+        // the window is being resized: no quality encode is wanted, a preview is shown.
+        // (the cover is width-limited in tall windows, so look for a height that changes it)
+        app.resize_at = Some(std::time::Instant::now());
+        let mut changed = None;
+        for h in [28u16, 24, 20, 18, 16, 15, 14] {
+            let _ = render(&mut app, 140, h);
+            let plan = crate::sixel::plan(app.sixel.area_now.unwrap(), app.cell_px).unwrap();
+            let shown = app.sixel.show.clone().expect("a picture follows the resize at every size");
+            assert!(shown.preview && app.sixel.want.is_none(), "{h}: preview only, no quality encode requested");
+            assert_eq!((shown.key, shown.rect), (plan.key, plan.rect), "{h}: sized for the panel as it is *now*");
+            assert!(matches!(&app.sixel.preview, Some((c, k, e)) if c == "c1" && *k == plan.key && !e.data.is_empty()), "{h}");
+            if plan.key != settled.key {
+                changed = Some(h);
+            }
+        }
+        assert!(changed.is_some(), "the panel never changed size, so this test proved nothing");
+
+        // the same for a divider drag
+        app.resize_at = None;
+        app.drag = Some(crate::dock::Divider::Col(0));
+        let _ = render(&mut app, 100, 30);
+        assert!(app.sixel.show.as_ref().is_some_and(|s| s.preview), "dragging a divider keeps the cover up");
+    }
+
+    #[test]
+    fn the_preview_stays_up_until_the_real_encode_arrives() {
+        let mut app = classic_sixel_app();
+        app.resize_at = Some(std::time::Instant::now());
+        let _ = render(&mut app, 130, 38);
+        let key = app.sixel.show.as_ref().unwrap().key;
+
+        // settled: the quality encode is asked for, and nothing is withdrawn meanwhile
+        app.resize_at = None;
+        let _ = render(&mut app, 130, 38);
+        assert!(matches!(&app.sixel.want, Some((_, p)) if p.key == key), "the real encode is requested");
+        let shown = app.sixel.show.clone().expect("still showing the approximation");
+        assert!(shown.preview && shown.key == key);
+
+        // the encode lands: now the real picture is shown, in the same place
+        let plan = app.sixel.want.as_ref().unwrap().1;
+        let (_, art) = app.art.as_ref().unwrap();
+        let enc = crate::sixel::encode_image(art.source(), &plan, app.cell_px);
+        app.sixel.cache = Some(("c1".into(), plan.key, enc));
+        let _ = render(&mut app, 130, 38);
+        let real = app.sixel.show.clone().unwrap();
+        assert!(!real.preview, "quality encode replaces the preview");
+        assert_eq!((real.rect, real.key), (shown.rect, shown.key), "…without moving");
+    }
+
+    #[test]
+    fn carrying_a_panel_still_hides_the_picture() {
+        let mut app = classic_sixel_app();
+        app.resize_at = Some(std::time::Instant::now());
+        app.moving = Some(crate::app::Moving { panel: crate::dock::PanelId::Cover, x: 5, y: 5 });
+        let _ = render(&mut app, 140, 40);
+        assert!(app.sixel.show.is_none() && app.sixel.want.is_none(), "the move overlay owns the gesture");
+        assert!(!app.live_resize() && app.settling());
+    }
+
+    #[test]
+    fn live_preview_is_safe_at_every_size() {
+        // the preview is encoded inside `draw`, so it must never panic or overrun for any panel size
+        let mut app = classic_sixel_app();
+        app.drag = Some(crate::dock::Divider::Col(0));
+        for w in (1..=90u16).step_by(3).chain([140, 200]) {
+            for h in (1..=30u16).step_by(2).chain([50]) {
+                let _ = render(&mut app, w, h);
+                if let (Some(s), Some((_, _, e))) = (&app.sixel.show, &app.sixel.preview) {
+                    assert!(e.width <= s.rect.width as u32 * app.cell_px.0 as u32 && e.height <= s.rect.height as u32 * app.cell_px.1 as u32, "{w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_size_alone_keeps_the_quality_picture() {
+        let mut app = classic_sixel_app();
+        let _ = render(&mut app, 140, 40);
+        let plan = app.sixel.want.as_ref().unwrap().1;
+        let enc = crate::sixel::encode_image(app.art.as_ref().unwrap().1.source(), &plan, app.cell_px);
+        app.sixel.cache = Some(("c1".into(), plan.key, enc));
+        let _ = render(&mut app, 140, 40);
+        assert!(app.sixel.show.as_ref().is_some_and(|s| !s.preview));
+        app.drag = Some(crate::dock::Divider::Col(0)); // mouse pressed on a border, nothing moved yet
+        let _ = render(&mut app, 140, 40);
+        assert!(app.sixel.show.as_ref().is_some_and(|s| !s.preview), "no downgrade to the preview when the size is unchanged");
+        assert!(app.sixel.preview.is_none(), "and no preview was even encoded");
     }
 }

@@ -6,6 +6,11 @@
 //! speaking IPC instead means no libmpv headers at build time — only the
 //! `mpv` binary has to be on `PATH` at runtime.
 //!
+//! The IPC transport is chosen at compile time from the *target* OS: a Unix
+//! domain socket on unix, a named pipe (`\\.\pipe\…`) on Windows. Both speak
+//! the identical line-delimited JSON protocol, so everything outside the
+//! small `ipc` module below is shared.
+//!
 //! If mpv isn't installed the app still runs (browse, search, queue); the
 //! player degrades to an inert stand-in and the UI shows an install hint.
 
@@ -16,8 +21,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::Settings;
 
+#[cfg(not(windows))]
 pub const INSTALL_HINT: &str = "mpv not found — install it for playback:  \
     arch: pacman -S mpv · debian: apt install mpv · fedora: dnf install mpv · macos: brew install mpv";
+#[cfg(windows)]
+pub const INSTALL_HINT: &str = "mpv not found — install it for playback and put mpv.exe on PATH:  \
+    winget install mpv · scoop install mpv · choco install mpv";
 
 /// How far short of the known duration an EOF must land to be treated as a
 /// truncated source (worth one resume) rather than a real track end. Wide
@@ -63,11 +72,77 @@ impl PlayerHandle {
     }
 }
 
+/// Platform transport for mpv's JSON IPC. Only this module differs per OS.
+#[cfg(unix)]
+mod ipc {
+    use std::path::{Path, PathBuf};
+
+    use tokio::net::{unix::{OwnedReadHalf, OwnedWriteHalf}, UnixStream};
+
+    pub type Rd = OwnedReadHalf;
+    pub type Wr = OwnedWriteHalf;
+
+    /// `$XDG_RUNTIME_DIR` (else the temp dir) / `rustdrome-mpv-<pid>.sock`
+    pub fn endpoint(pid: u32) -> PathBuf {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join(format!("rustdrome-mpv-{pid}.sock"))
+    }
+
+    /// Clear a stale socket file before mpv binds it.
+    pub fn prepare(ep: &Path) {
+        let _ = std::fs::remove_file(ep);
+    }
+
+    pub async fn connect(ep: &Path) -> std::io::Result<(Rd, Wr)> {
+        Ok(UnixStream::connect(ep).await?.into_split())
+    }
+
+    /// The socket is a file: remove it. (Named pipes vanish with mpv.)
+    pub fn cleanup(ep: &Path) {
+        let _ = std::fs::remove_file(ep);
+    }
+}
+
+#[cfg(windows)]
+mod ipc {
+    use std::path::{Path, PathBuf};
+
+    use tokio::io::{ReadHalf, WriteHalf};
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+
+    pub type Rd = ReadHalf<NamedPipeClient>;
+    pub type Wr = WriteHalf<NamedPipeClient>;
+
+    /// `\\.\pipe\rustdrome-mpv-<pid>` — mpv creates the pipe (server side).
+    pub fn endpoint(pid: u32) -> PathBuf {
+        PathBuf::from(format!(r"\\.\pipe\rustdrome-mpv-{pid}"))
+    }
+
+    /// Pipes live in the kernel's namespace, so there is nothing stale to clear.
+    pub fn prepare(_ep: &Path) {}
+
+    /// Fails with NotFound until mpv has created the pipe and with
+    /// ERROR_PIPE_BUSY while it is between instances; the caller retries both.
+    pub async fn connect(ep: &Path) -> std::io::Result<(Rd, Wr)> {
+        let client = ClientOptions::new().open(ep)?;
+        Ok(tokio::io::split(client))
+    }
+
+    pub fn cleanup(_ep: &Path) {}
+}
+
 fn cmd(args: &[Value]) -> String {
     let mut s = json!({ "command": args }).to_string();
     s.push('\n');
     s
 }
+
+#[cfg(windows)]
+#[path = "winjob.rs"]
+mod job;
 
 pub struct Player {
     shared: Arc<Mutex<Shared>>,
@@ -153,57 +228,81 @@ impl Player {
         a
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn spawn(
         settings: &Settings,
         events: UnboundedSender<PlayerEvent>,
         ao: Option<&str>,
     ) -> Result<Self, String> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
 
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let socket = dir.join(format!("rustdrome-mpv-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
+        let socket = ipc::endpoint(std::process::id());
+        ipc::prepare(&socket);
 
-        let mut child = tokio::process::Command::new("mpv")
+        let mut command = tokio::process::Command::new("mpv");
+        command
             .args(Self::mpv_args(settings, &socket, ao))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            // glibc keeps a malloc arena per thread and is slow to give
-            // memory back; mpv reloads files constantly, so left alone its
-            // heap ratchets up ~1 MB per track. One arena + an eager trim
-            // threshold keeps it flat.
-            .env("MALLOC_ARENA_MAX", "1")
-            .env("MALLOC_TRIM_THRESHOLD_", "131072")
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "mpv not found".to_string()
-                } else {
-                    format!("couldn't start mpv: {e}")
-                }
-            })?;
+            .kill_on_drop(true);
+        // glibc keeps a malloc arena per thread and is slow to give
+        // memory back; mpv reloads files constantly, so left alone its
+        // heap ratchets up ~1 MB per track. One arena + an eager trim
+        // threshold keeps it flat.
+        #[cfg(unix)]
+        command.env("MALLOC_ARENA_MAX", "1").env("MALLOC_TRIM_THRESHOLD_", "131072");
+        // mpv.exe is a console program: never let it flash its own window
+        // (CREATE_NO_WINDOW).
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        // If we die without running `Drop` (SIGKILL, a crash, a force-closed
+        // terminal that never delivers a catchable signal) the kernel must take
+        // mpv with us, or an idle mpv lingers forever. The signal is tied to the
+        // *thread* that spawned it, which here is the main thread: it lives as
+        // long as the process does.
+        #[cfg(target_os = "linux")]
+        {
+            let parent = unsafe { libc::getpid() };
+            // SAFETY: the closure only makes async-signal-safe calls (prctl,
+            // getppid, _exit), as required between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                    // we may already have died between fork and prctl
+                    if libc::getppid() != parent {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "mpv not found".to_string()
+            } else {
+                format!("couldn't start mpv: {e}")
+            }
+        })?;
 
-        // mpv creates the socket a moment after launch
-        let mut stream = None;
+        #[cfg(windows)]
+        if let Some(h) = child.raw_handle() {
+            job::kill_with_us(h as isize);
+        }
+
+        // mpv creates the socket / pipe a moment after launch
+        let mut conn = None;
         for _ in 0..60 {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!("mpv exited immediately ({status})"));
             }
-            if let Ok(s) = UnixStream::connect(&socket).await {
-                stream = Some(s);
+            if let Ok(c) = ipc::connect(&socket).await {
+                conn = Some(c);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let stream = stream.ok_or("timed out waiting for mpv's IPC socket")?;
-        let (rd, mut wr) = stream.into_split();
+        let (rd, mut wr) = conn.ok_or("timed out waiting for mpv's IPC endpoint")?;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -242,13 +341,13 @@ impl Player {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub async fn spawn(
         _settings: &Settings,
         _events: UnboundedSender<PlayerEvent>,
         _ao: Option<&str>,
     ) -> Result<Self, String> {
-        Err("playback over mpv IPC currently needs a Unix platform".into())
+        Err("mpv IPC is implemented for Unix sockets and Windows named pipes only".into())
     }
 
     fn send(&self, args: &[Value]) {
@@ -376,7 +475,10 @@ impl Drop for Player {
         self.shared.lock().unwrap().want_playing = false;
         self.send(&["quit".into()]);
         if let Some(s) = &self.socket {
-            let _ = std::fs::remove_file(s);
+            #[cfg(any(unix, windows))]
+            ipc::cleanup(s);
+            #[cfg(not(any(unix, windows)))]
+            let _ = s;
         }
     }
 }
@@ -542,6 +644,22 @@ mod tests {
         assert!(cm[0].contains("seek") && cm[0].contains("42"));
         let (_, cm) = feed(&sh, &[r#"{"event":"file-loaded"}"#]);
         assert!(cm.is_empty(), "pending start is consumed once");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_is_a_named_pipe() {
+        let p = ipc::endpoint(4242);
+        assert_eq!(p.to_str().unwrap(), r"\\.\pipe\rustdrome-mpv-4242");
+        let a = Player::mpv_args(&Settings::default(), &p, None);
+        assert!(a.contains(&r"--input-ipc-server=\\.\pipe\rustdrome-mpv-4242".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_is_a_socket_file() {
+        let p = ipc::endpoint(4242);
+        assert!(p.to_str().unwrap().ends_with("rustdrome-mpv-4242.sock"));
     }
 
     #[test]

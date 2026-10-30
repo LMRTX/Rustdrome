@@ -18,9 +18,11 @@ use ratatui::style::{Color, Style};
 
 /// Longest edge kept in memory. Half-cell rendering needs one pixel per
 /// column and two per row, so even a very wide terminal never wants more
-/// than ~200 — and the sixel path re-decodes from disk at exactly the size it
-/// needs, so nothing larger has to stay resident (a 320px copy was 300 KB).
-const MAX_EDGE: u32 = 192;
+/// than ~200; the sixel path re-decodes from disk at exactly the size it
+/// needs. The extra headroom (256 px ≈ 190 KB) is what the live-resize preview
+/// resamples from — it is rendered at panel size, so a source much below that
+/// looks soft while a panel is dragged large.
+const MAX_EDGE: u32 = 256;
 
 /// What size to ask the server for. Enough for a big sixel/zen cover; the
 /// old 1200px request cost a 4 MB decode and a multi-MB cache file per album.
@@ -179,6 +181,11 @@ impl Art {
 
     pub fn tint(&self) -> Option<Color> {
         extract_vibrant(&self.src)
+    }
+
+    /// The resident copy of the cover (≤ `MAX_EDGE`), for the sixel live preview.
+    pub fn source(&self) -> &RgbImage {
+        &self.src
     }
 
     /// Draw the cover centered in `area`, as large as fits while staying

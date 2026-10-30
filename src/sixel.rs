@@ -176,6 +176,11 @@ pub struct Encoded {
     /// the canvas, in pixels (a whole number of cells)
     pub width: u32,
     pub height: u32,
+    /// where the picture itself sits on the canvas, in pixels: `(x, y, w, h)`.
+    /// Everything outside it is transparent, everything inside is opaque —
+    /// which is what lets a new image be drawn straight over an old one
+    /// without erasing the cells it will cover anyway (see [`covered_cells`])
+    pub pic: (u32, u32, u32, u32),
 }
 
 /// Decode `path`, fit it inside `plan.side`, quantise, and encode it centred on
@@ -189,6 +194,121 @@ pub fn encode_file(path: &std::path::Path, plan: &Plan, cell: (u16, u16)) -> Opt
 pub fn encode_image(img: &RgbImage, plan: &Plan, cell: (u16, u16)) -> Encoded {
     let (cw, ch) = (plan.key.cols as u32 * cell.0.max(1) as u32, plan.key.rows as u32 * cell.1.max(1) as u32);
     encode_canvas(&fit(img, plan.key.side), cw, ch, PALETTE)
+}
+
+// ── live preview ──────────────────────────────────────────────────────
+//
+// Sixel is a bitmap: the terminal cannot scale it, so a picture that follows a
+// panel while it is dragged has to be *re-encoded* at every size. The quality
+// encoder (NeuQuant + Floyd–Steinberg, ≈40 ms at 640 px) is too slow for that,
+// and withdrawing the picture until the drag ends leaves a hole. So while the
+// layout is moving we send a cheap approximation instead — a bilinear resample
+// of the resident copy onto a fixed colour cube with ordered dithering, a few
+// milliseconds — and swap in the real encode once things settle.
+
+/// Levels per channel of the preview's fixed colour cube: 6 × 7 × 6 = 252
+/// registers (green gets the extra level; the eye is most sensitive there).
+const PV: (u32, u32, u32) = (6, 7, 6);
+
+/// 4×4 Bayer thresholds.
+const BAYER: [u32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+fn preview_palette() -> Vec<[u8; 3]> {
+    let lv = |i: u32, n: u32| (i * 255 / (n - 1)) as u8;
+    let mut p = Vec::with_capacity((PV.0 * PV.1 * PV.2) as usize);
+    for r in 0..PV.0 {
+        for g in 0..PV.1 {
+            for b in 0..PV.2 {
+                p.push([lv(r, PV.0), lv(g, PV.1), lv(b, PV.2)]);
+            }
+        }
+    }
+    p
+}
+
+/// Quick, lower-quality encode of `src` for `plan` — same canvas, same
+/// picture size and the same pixel-exact centring as [`encode_image`], so the
+/// swap to the real encode changes the picture's quality, never its place.
+pub fn encode_preview(src: &RgbImage, plan: &Plan, cell: (u16, u16)) -> Encoded {
+    let (cw, ch) = (plan.key.cols as u32 * cell.0.max(1) as u32, plan.key.rows as u32 * cell.1.max(1) as u32);
+    let (sw, sh) = src.dimensions();
+    let side = plan.key.side.max(1);
+    let scale = side as f64 / sw.max(sh).max(1) as f64;
+    let nw = ((sw as f64 * scale).round() as u32).clamp(1, side);
+    let nh = ((sh as f64 * scale).round() as u32).clamp(1, side);
+    if sw == 0 || sh == 0 {
+        return emit(&preview_palette(), &vec![0; (nw * nh) as usize], nw, nh, cw, ch);
+    }
+
+    // sample positions in 16.16 fixed point, computed once per row/column
+    let axis = |n: u32, s: u32| -> Vec<(usize, usize, u32)> {
+        (0..n)
+            .map(|i| {
+                let pos = ((i as u64 * 2 + 1) * s as u64 * 65536 / (n as u64 * 2)) as i64 - 32768;
+                let pos = pos.max(0);
+                let a = ((pos >> 16) as u32).min(s - 1);
+                let b = (a + 1).min(s - 1);
+                (a as usize, b as usize, ((pos & 0xFFFF) >> 8) as u32)
+            })
+            .collect()
+    };
+    let (xs, ys) = (axis(nw, sw), axis(nh, sh));
+    let raw = src.as_raw();
+    let stride = sw as usize * 3;
+    let level = |c: u32, n: u32, t: u32| {
+        let v = c * (n - 1) * 16 / 255;
+        (v >> 4) + ((v & 15) > t) as u32
+    };
+
+    let mut idx = vec![0u8; (nw * nh) as usize];
+    for (y, &(ya, yb, wy)) in ys.iter().enumerate() {
+        let (ra, rb) = (&raw[ya * stride..], &raw[yb * stride..]);
+        for (x, &(xa, xb, wx)) in xs.iter().enumerate() {
+            let t = BAYER[(y & 3) * 4 + (x & 3)];
+            let mut q = [0u32; 3];
+            for (k, qk) in q.iter_mut().enumerate() {
+                let top = ra[xa * 3 + k] as u32 * (256 - wx) + ra[xb * 3 + k] as u32 * wx;
+                let bot = rb[xa * 3 + k] as u32 * (256 - wx) + rb[xb * 3 + k] as u32 * wx;
+                let c = (top * (256 - wy) + bot * wy) >> 16;
+                *qk = c.min(255);
+            }
+            let (r, g, b) = (level(q[0], PV.0, t), level(q[1], PV.1, t), level(q[2], PV.2, t));
+            idx[y * nw as usize + x] = ((r * PV.1 + g) * PV.2 + b) as u8;
+        }
+    }
+    emit(&preview_palette(), &idx, nw, nh, cw, ch)
+}
+
+/// The cells that `enc`, placed with its canvas at `rect`, covers *completely*
+/// with opaque pixels. Drawing the image overwrites those cells' old contents,
+/// so a repaint need not blank them first — which is what keeps a picture
+/// from flickering when it is replaced by one of nearly the same size.
+pub fn covered_cells(enc: &Encoded, rect: Rect, cell: (u16, u16)) -> Rect {
+    let (cw, ch) = (cell.0.max(1) as u32, cell.1.max(1) as u32);
+    let (px, py, pw, ph) = enc.pic;
+    let (x0, y0) = (px.div_ceil(cw), py.div_ceil(ch));
+    let (x1, y1) = ((px + pw) / cw, (py + ph) / ch);
+    if x1 <= x0 || y1 <= y0 {
+        return Rect::default();
+    }
+    let r = Rect::new(rect.x + x0 as u16, rect.y + y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16);
+    r.intersection(rect)
+}
+
+/// Does the window's pixel size still add up to `cell` — i.e. is the cell size
+/// the one we measured? A resize that only adds or removes whole cells leaves
+/// `W ≈ cols × cell_w` (plus less than one cell of slack and a little padding);
+/// a font zoom or a DPI change does not. `None` when the terminal doesn't
+/// report pixel sizes, so nothing can be said.
+pub fn cell_consistent(win: (u16, u16, u16, u16), cell: (u16, u16)) -> Option<bool> {
+    let (cols, rows, w, h) = (win.0 as u32, win.1 as u32, win.2 as u32, win.3 as u32);
+    if cols == 0 || rows == 0 || w == 0 || h == 0 {
+        return None;
+    }
+    const PAD: u32 = 24; // window padding / borders some terminals add
+    let (cw, ch) = (cell.0.max(1) as u32, cell.1.max(1) as u32);
+    let ok = |px: u32, n: u32, c: u32| px + 1 >= n * c && px < (n + 1) * c + PAD;
+    Some(ok(w, cols, cw) && ok(h, rows, ch))
 }
 
 fn fit(img: &RgbImage, side: u32) -> RgbImage {
@@ -315,10 +435,16 @@ pub fn encode(img: &RgbImage, max_colors: usize) -> Encoded {
 /// are left unset (`P2 = 1`: transparent), so the cells underneath show
 /// through and the padding costs nothing.
 pub fn encode_canvas(img: &RgbImage, cw: u32, ch: u32, max_colors: usize) -> Encoded {
-    let (w, h) = img.dimensions();
+    let (palette, idx) = quantize(img, max_colors.min(PALETTE));
+    emit(&palette, &idx, img.width(), img.height(), cw, ch)
+}
+
+/// Write palette-indexed pixels (`w × h`, row-major) as a sixel, centred on a
+/// `cw × ch` canvas. The shared back half of the quality encoder and the
+/// live-resize preview.
+fn emit(palette: &[[u8; 3]], idx: &[u8], w: u32, h: u32, cw: u32, ch: u32) -> Encoded {
     let (cw, ch) = (cw.max(w), ch.max(h));
     let (ox, oy) = ((cw - w) / 2, (ch - h) / 2);
-    let (palette, idx) = quantize(img, max_colors.min(PALETTE));
     let (wu, hu) = (w as usize, h as usize);
     let (cwu, chu, oxu, oyu) = (cw as usize, ch as usize, ox as usize, oy as usize);
 
@@ -367,7 +493,7 @@ pub fn encode_canvas(img: &RgbImage, cw: u32, ch: u32, max_colors: usize) -> Enc
         out.pop(); // no new line after the last band
     }
     out.extend_from_slice(b"\x1b\\");
-    Encoded { data: out, width: cw, height: ch }
+    Encoded { data: out, width: cw, height: ch, pic: (ox, oy, w, h) }
 }
 
 /// Run-length encode one color's column masks (`!<n><char>` for runs > 3).
@@ -405,6 +531,9 @@ pub struct Shown {
     pub rect: Rect,
     /// the art panel's area when this was drawn
     pub area: Rect,
+    /// the quick live-resize approximation rather than the quality encode.
+    /// Part of the identity, so the swap to the real one is a repaint
+    pub preview: bool,
 }
 
 #[derive(Default)]
@@ -425,6 +554,13 @@ pub struct SixelState {
     pub show: Option<Shown>,
     /// what we last wrote to the terminal
     pub shown: Option<Shown>,
+    /// the live-resize approximation for the cover being resized: `(cover id, size, data)`.
+    /// Cheap to rebuild and dropped as soon as the real encode has replaced it
+    pub preview: Option<(String, PlanKey, Encoded)>,
+    /// cells of the picture's old rectangle that the new frame left blank, with
+    /// their background — the pixels under them are stale and `sync` must
+    /// blank them (see [`note_frame`])
+    pub blanks: Vec<(u16, u16, ratatui::style::Color)>,
 }
 
 use crate::app::{App, Msg};
@@ -437,6 +573,14 @@ impl App {
     /// the way of the right one.
     pub fn settling(&self) -> bool {
         self.drag.is_some() || self.moving.is_some() || self.resize_at.is_some()
+    }
+
+    /// The panel is being resized right now (divider drag or window/font
+    /// resize) and the picture should *follow* it with the quick preview
+    /// encode rather than disappear. A panel being carried around (`moving`)
+    /// still withdraws it: the move overlay owns that gesture.
+    pub fn live_resize(&self) -> bool {
+        self.moving.is_none() && (self.drag.is_some() || self.resize_at.is_some())
     }
 
     /// Kick off a background encode if the panel wants an image we don't have.
@@ -467,27 +611,29 @@ impl App {
     /// The cell size in pixels is what turns "this many cells" into "this many
     /// pixels", so a stale value makes the picture the wrong size for its
     /// panel (too small after zooming the font in, too big after zooming out).
-    /// Called every tick; cheap unless something actually changed:
     ///
-    /// * the window's size in cells *or pixels* changing is the trigger — the
-    ///   pixel size catches a DPI change that leaves rows/columns alone;
-    /// * after it settles for 150ms, re-ask the terminal (`CSI 16 t`, exact);
+    /// * [`App::note_window`] runs on every resize event *and* every tick (a DPI
+    ///   change can leave the cell counts alone). It tells a plain resize —
+    ///   whole cells added or removed, cell size unchanged — from a font or DPI
+    ///   change, and for the latter switches to a pixels ÷ cells estimate at
+    ///   once, so the live preview is about the right size straight away;
+    /// * only a font/DPI change needs the exact answer: after it has settled for
+    ///   150ms, re-ask the terminal (`CSI 16 t`). A plain resize skips that;
     /// * terminals that never answer fall back to window pixels ÷ cells.
     pub fn maintain_cell_size(&mut self, input: &crate::input::Input) {
-        use std::time::Instant;
         if self.art_mode != crate::art::ArtMode::Sixel {
             return;
         }
-        let ws = crossterm::terminal::window_size().ok().map(|w| (w.columns, w.rows, w.width, w.height));
-        if ws != self.win_sig {
-            self.win_sig = ws;
-            self.resize_at = Some(Instant::now());
-        }
+        self.note_window();
         let Some(t) = self.resize_at else { return };
         if t.elapsed() < Duration::from_millis(150) {
             return; // still moving (a drag-resize fires dozens of events)
         }
         self.resize_at = None;
+        if !std::mem::take(&mut self.cell_stale) {
+            return; // the cell size is still the one we measured
+        }
+        let ws = crossterm::terminal::window_size().ok().map(|w| (w.columns, w.rows, w.width, w.height));
         let mut cell = None;
         if self.cell_probe_ok {
             match input.paused(|| probe(Duration::from_millis(250))).cell_px {
@@ -504,6 +650,40 @@ impl App {
         }
         if let Some(c) = cell {
             self.cell_px = c;
+        }
+    }
+
+    /// The window's size (cells or pixels) changed: start (or extend) the live
+    /// resize, and decide whether the cell size can still be trusted.
+    pub fn note_window(&mut self) {
+        let ws = crossterm::terminal::window_size().ok().map(|w| (w.columns, w.rows, w.width, w.height));
+        if ws == self.win_sig {
+            return;
+        }
+        self.win_sig = ws;
+        self.resize_at = Some(std::time::Instant::now());
+        match ws.and_then(|w| cell_consistent(w, self.cell_px)) {
+            Some(true) => {} // only the number of cells changed
+            Some(false) => {
+                // font zoom / DPI change: pixels ÷ cells is close enough for the
+                // preview; the exact value is read once the window settles
+                if let Some((c, r, w, h)) = ws {
+                    self.cell_px = ((w / c).max(1), (h / r).max(1));
+                }
+                self.cell_stale = true;
+            }
+            None => self.cell_stale = true, // no pixel size to judge by
+        }
+    }
+
+    /// A `Resize` event arrived: start the live resize. (If the size really
+    /// changed, ratatui clears the screen and `draw_step` forgets the picture;
+    /// the next frame then draws the preview at the new size inside the same
+    /// synchronized update.)
+    pub fn on_resize(&mut self) {
+        if self.art_mode == crate::art::ArtMode::Sixel {
+            self.resize_at = Some(std::time::Instant::now());
+            self.note_window();
         }
     }
 
@@ -545,27 +725,76 @@ pub fn free_spans(rect: Rect, overlays: &[Rect]) -> Vec<(u16, u16, u16)> {
     spans
 }
 
-/// Blank the picture's cells (outside any overlay) with the theme background.
-/// Only safe while those cells are still blank in ratatui's buffer — i.e. the
-/// panel hasn't moved — which is why the callers check.
-fn erase(term: &mut ratatui::DefaultTerminal, rect: Rect, overlays: &[Rect], bg: ratatui::style::Color) -> std::io::Result<()> {
-    use std::io::Write;
+fn term_color(bg: ratatui::style::Color) -> crossterm::style::Color {
     // theme backgrounds are either true color or "the terminal's own"
-    let bg = match bg {
+    match bg {
         ratatui::style::Color::Rgb(r, g, b) => crossterm::style::Color::Rgb { r, g, b },
         _ => crossterm::style::Color::Reset,
-    };
-    let out = term.backend_mut();
-    for (y, x0, x1) in free_spans(rect, overlays) {
+    }
+}
+
+/// Queue blanks over runs `(y, x_start, x_end, background)`.
+fn queue_blanks(
+    out: &mut impl std::io::Write,
+    runs: impl IntoIterator<Item = (u16, u16, u16, ratatui::style::Color)>,
+) -> std::io::Result<()> {
+    for (y, x0, x1, bg) in runs {
         crossterm::queue!(
             out,
             crossterm::cursor::MoveTo(x0, y),
-            crossterm::style::SetBackgroundColor(bg),
+            crossterm::style::SetBackgroundColor(term_color(bg)),
             crossterm::style::Print(" ".repeat((x1 - x0) as usize)),
             crossterm::style::ResetColor
         )?;
     }
-    out.flush()
+    Ok(())
+}
+
+/// Runs of the cells in `cells` (row-major, as `note_frame` records them) that
+/// no `skip` rectangle covers, merged while the background stays the same.
+fn blank_runs(cells: &[(u16, u16, ratatui::style::Color)], skip: &[Rect]) -> Vec<(u16, u16, u16, ratatui::style::Color)> {
+    let covered = |x: u16, y: u16| skip.iter().any(|o| o.x <= x && x < o.x + o.width && o.y <= y && y < o.y + o.height);
+    let mut runs: Vec<(u16, u16, u16, ratatui::style::Color)> = Vec::new();
+    for &(x, y, bg) in cells.iter().filter(|&&(x, y, _)| !covered(x, y)) {
+        match runs.last_mut() {
+            Some((ly, _, lx1, lbg)) if *ly == y && *lx1 == x && *lbg == bg => *lx1 = x + 1,
+            _ => runs.push((y, x, x + 1, bg)),
+        }
+    }
+    runs
+}
+
+/// The encoded image `w` refers to, if it is still the one we hold.
+fn image_for<'a>(st: &'a SixelState, w: &Shown) -> Option<&'a Encoded> {
+    let slot = if w.preview { &st.preview } else { &st.cache };
+    slot.as_ref().filter(|(c, k, _)| *c == w.cover && *k == w.key).map(|(_, _, e)| e)
+}
+
+/// Called right after a frame is drawn, with the buffer ratatui just painted.
+///
+/// When the art panel's *area* has changed under a picture that is on screen
+/// (a divider is being dragged), ratatui has repainted every cell whose content
+/// differs — but the cells that were blank under the old picture and are still
+/// blank are, to ratatui, unchanged, so it never touched them and the old
+/// pixels sit there. Those are exactly the cells in the old rectangle that are
+/// blank in the new buffer; record them so [`sync`] can blank just those.
+/// (Blanking the whole old rectangle would wipe the new neighbours' borders.)
+pub fn note_frame(app: &mut App, buf: &ratatui::buffer::Buffer) {
+    app.sixel.blanks.clear();
+    let Some(rect) = app.sixel.shown.as_ref().map(|s| s.rect) else { return };
+    let (Some(now), Some(old_area)) = (app.sixel.area_now, app.sixel.shown.as_ref().map(|s| s.area)) else { return };
+    if now == old_area || app.moving.is_some() {
+        return;
+    }
+    let r = rect.intersection(buf.area);
+    for y in r.y..r.y + r.height {
+        for x in r.x..r.x + r.width {
+            let c = &buf[(x, y)];
+            if c.symbol() == " " {
+                app.sixel.blanks.push((x, y, c.bg));
+            }
+        }
+    }
 }
 
 /// Reconcile the terminal with what `draw` says should be visible. Runs after
@@ -574,13 +803,18 @@ fn erase(term: &mut ratatui::DefaultTerminal, rect: Rect, overlays: &[Rect], bg:
 /// Rules, and why:
 /// * the image is blank cells as far as ratatui knows, so its diff never
 ///   touches it — it stays put on its own until something changes it;
-/// * to take it down, blank *just its cells* (minus whatever a modal or toast
-///   already painted over). A full-screen clear would leave the whole terminal
-///   black until the next frame, which is what a drag looked like;
-/// * that is only safe while the cells are *still blank* in ratatui's buffer —
-///   i.e. the art panel hasn't moved. If it has, the screen is cleared and
-///   the function returns `true`: the caller must redraw **immediately**, in
-///   the same step, so nothing is ever seen blank.
+/// * **a picture that is replaced is not withdrawn first.** Its new version is
+///   drawn over it, and only the cells the new one will *not* fully cover are
+///   blanked (`covered_cells`) — all in one step inside the synchronized update.
+///   So a drag or a resize shows a picture that follows the panel, never a hole;
+/// * to take it down for good, blank *just its cells* (minus whatever a modal or
+///   toast already painted over). A full-screen clear would leave the whole
+///   terminal black until the next frame;
+/// * if the panel's area changed under it, the cells to blank are the ones the
+///   new frame left blank (`note_frame`), because ratatui has already painted
+///   the rest. Outside a live resize (a panel being moved, a layout switch) the
+///   screen is cleared instead and the function returns `true`: the caller must
+///   redraw **immediately**, in the same step, so nothing is ever seen blank.
 pub fn sync(app: &mut App, term: &mut ratatui::DefaultTerminal) -> std::io::Result<bool> {
     use std::io::Write;
 
@@ -588,13 +822,15 @@ pub fn sync(app: &mut App, term: &mut ratatui::DefaultTerminal) -> std::io::Resu
         return Ok(false);
     }
     let bg = app.theme().bg;
-    if app.settling() {
-        // the layout is changing (a divider drag, a zoom, a window resize): drop
-        // the picture once and wait — redrawing it every frame would crawl, and
-        // a size computed from a stale cell size would be wrong anyway
+    if app.moving.is_some() {
+        // a panel is being carried: drop the picture once and wait — the move
+        // overlay is drawn over where it was, and the layout under it is changing
         if let Some(old) = app.sixel.shown.take() {
             if app.sixel.area_now == Some(old.area) {
-                erase(term, old.rect, &app.overlay_rects, bg)?;
+                let skip = app.overlay_rects.clone();
+                let out = term.backend_mut();
+                queue_blanks(out, free_spans(old.rect, &skip).into_iter().map(|(y, a, b)| (y, a, b, bg)))?;
+                out.flush()?;
             } else {
                 return clear_screen(term);
             }
@@ -606,24 +842,42 @@ pub fn sync(app: &mut App, term: &mut ratatui::DefaultTerminal) -> std::io::Resu
     if want == app.sixel.shown {
         return Ok(false);
     }
+    // what is about to be drawn, and the cells it is certain to overwrite
+    let cell = app.cell_px;
+    let hole = want
+        .as_ref()
+        .and_then(|w| image_for(&app.sixel, w).map(|e| covered_cells(e, w.rect, cell)))
+        .unwrap_or_default();
     if let Some(old) = app.sixel.shown.take() {
+        let mut skip = app.overlay_rects.clone();
+        skip.push(hole);
         if app.sixel.area_now == Some(old.area) {
-            erase(term, old.rect, &app.overlay_rects, bg)?;
+            let out = term.backend_mut();
+            queue_blanks(out, free_spans(old.rect, &skip).into_iter().map(|(y, a, b)| (y, a, b, bg)))?;
+        } else if app.live_resize() && app.sixel.area_now.is_some() {
+            let runs = blank_runs(&app.sixel.blanks, &skip);
+            queue_blanks(term.backend_mut(), runs)?;
         } else {
             // the panel moved under it: stale pixels may sit in cells that are
             // blank both before and after, so only a full repaint is certain
             return clear_screen(term);
         }
     }
-    if let Some(w) = want {
-        if let Some((c, s, enc)) = &app.sixel.cache {
-            if *c == w.cover && *s == w.key {
-                let out = term.backend_mut();
-                crossterm::queue!(out, crossterm::cursor::MoveTo(w.rect.x, w.rect.y))?;
-                out.write_all(&enc.data)?;
-                out.flush()?;
-                app.sixel.shown = Some(w);
-            }
+    let mut drawn = false;
+    if let Some(w) = &want {
+        if let Some(enc) = image_for(&app.sixel, w) {
+            let out = term.backend_mut();
+            crossterm::queue!(out, crossterm::cursor::MoveTo(w.rect.x, w.rect.y))?;
+            out.write_all(&enc.data)?;
+            drawn = true;
+        }
+    }
+    term.backend_mut().flush()?;
+    if drawn {
+        let preview = want.as_ref().is_some_and(|w| w.preview);
+        app.sixel.shown = want;
+        if !preview && app.sixel.preview.take().is_some() {
+            crate::mem::trim(); // the quick version has done its job
         }
     }
     Ok(false)
@@ -966,5 +1220,148 @@ mod tests {
         assert_eq!((f.width(), f.height()), (120, 90));
         let tall = fit(&RgbImage::from_pixel(100, 400, Rgb([1, 1, 1])), 200);
         assert_eq!((tall.width(), tall.height()), (50, 200));
+    }
+
+    fn ramp(w: u32, h: u32) -> RgbImage {
+        let mut img = RgbImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgb([(x * 255 / w.max(1)) as u8, (y * 255 / h.max(1)) as u8, ((x + y) * 120 / (w + h)) as u8 + 40]);
+        }
+        img
+    }
+
+    #[test]
+    fn preview_lands_exactly_where_the_quality_encode_does() {
+        // the swap from preview to real encode must change quality, never position
+        for (area, cell, src) in [
+            (Rect::new(0, 0, 34, 12), (10u16, 20u16), (200u32, 200u32)),
+            (Rect::new(0, 0, 41, 17), (9, 18), (256, 256)),
+            (Rect::new(0, 0, 20, 30), (14, 28), (256, 190)), // non-square cover
+            (Rect::new(0, 0, 9, 4), (7, 15), (64, 64)),
+        ] {
+            let img = ramp(src.0, src.1);
+            let p = plan(area, cell).expect("plan");
+            let (pv, q) = (encode_preview(&img, &p, cell), encode_image(&img, &p, cell));
+            let ctx = format!("{area:?} cell {cell:?} src {src:?}");
+            assert_eq!((pv.width, pv.height), (q.width, q.height), "{ctx}: canvas");
+            assert_eq!(pv.pic, q.pic, "{ctx}: picture box");
+            let (dw, dh, dp) = decode(&pv.data);
+            let (_, _, dq) = decode(&q.data);
+            assert_eq!((dw, dh), (p.key.cols as u32 * cell.0 as u32, p.key.rows as u32 * cell.1 as u32), "{ctx}");
+            // the same pixels are opaque / transparent in both
+            let mism = dp.iter().zip(&dq).filter(|(a, b)| a.is_some() != b.is_some()).count();
+            assert_eq!(mism, 0, "{ctx}: {mism} pixels differ in transparency");
+        }
+    }
+
+    #[test]
+    fn preview_looks_like_the_picture() {
+        let img = ramp(240, 240);
+        let p = plan(Rect::new(0, 0, 30, 12), (10, 20)).unwrap();
+        let enc = encode_preview(&img, &p, (10, 20));
+        let (w, _, px) = decode(&enc.data);
+        let (ox, oy, pw, ph) = enc.pic;
+        // compare block averages of the preview with the same blocks of the source,
+        // resampled to the picture's size (the eye averages ordered-dither grain away)
+        let src = image::imageops::resize(&img, pw, ph, FilterType::Triangle);
+        let (mut err, mut n) = (0u64, 0u64);
+        for by in (0..ph - 8).step_by(8) {
+            for bx in (0..pw - 8).step_by(8) {
+                for k in 0..3 {
+                    let (mut a, mut b) = (0i64, 0i64);
+                    for dy in 0..8 {
+                        for dx in 0..8 {
+                            a += px[((oy + by + dy) * w + ox + bx + dx) as usize].expect("opaque inside the picture")[k] as i64;
+                            b += src.get_pixel(bx + dx, by + dy).0[k] as i64;
+                        }
+                    }
+                    err += (a - b).unsigned_abs() / 64;
+                    n += 1;
+                }
+            }
+        }
+        let mean = err as f64 / n as f64;
+        assert!(mean < 9.0, "block-averaged error {mean:.2}/255 is too coarse for a preview");
+    }
+
+    #[test]
+    fn preview_survives_degenerate_sources_and_sizes() {
+        let p = plan(Rect::new(0, 0, 30, 12), (10, 20)).unwrap();
+        for src in [(1u32, 1u32), (1, 40), (40, 1), (3, 3)] {
+            let enc = encode_preview(&RgbImage::from_pixel(src.0, src.1, Rgb([9, 99, 199])), &p, (10, 20));
+            let (w, h, px) = decode(&enc.data);
+            assert_eq!((w, h), (enc.width, enc.height), "{src:?}");
+            assert!(px.iter().any(|p| p.is_some()), "{src:?}: something is drawn");
+        }
+        // a flat colour maps to one palette entry and the sixel is tiny (RLE)
+        let flat = encode_preview(&RgbImage::from_pixel(64, 64, Rgb([255, 255, 255])), &p, (10, 20));
+        assert!(flat.data.len() < 8 * 1024, "{} bytes", flat.data.len());
+        // pure black / white hit the ends of the cube exactly, with no dither noise
+        let (_, _, px) = decode(&flat.data);
+        assert!(px.iter().flatten().all(|c| *c == [255, 255, 255]));
+    }
+
+    #[test]
+    fn covered_cells_are_only_the_cells_the_picture_fills_completely() {
+        let enc = |pic| Encoded { data: vec![], width: 100, height: 100, pic };
+        let rect = Rect::new(4, 2, 10, 5);
+        // picture 95×100 at (5,3) on 10×20 cells: columns 1..=9 are full, rows 1..=4
+        assert_eq!(covered_cells(&enc((5, 3, 95, 100)), rect, (10, 20)), Rect::new(5, 3, 9, 4));
+        // a picture that fills its canvas exactly covers all of it
+        assert_eq!(covered_cells(&enc((0, 0, 100, 100)), rect, (10, 20)), Rect::new(4, 2, 10, 5));
+        // smaller than a cell: nothing is certain
+        assert_eq!(covered_cells(&enc((5, 5, 8, 15)), rect, (10, 20)), Rect::default());
+        // never spills outside the canvas
+        let c = covered_cells(&enc((0, 0, 300, 300)), rect, (10, 20));
+        assert!(c.x >= rect.x && c.y >= rect.y && c.right() <= rect.right() && c.bottom() <= rect.bottom());
+    }
+
+    #[test]
+    fn cell_size_consistency_tells_a_resize_from_a_font_change() {
+        let cell = (10u16, 20u16);
+        // plain resizes: whole cells added/removed, window padding of a few px
+        assert_eq!(cell_consistent((100, 40, 1000, 800), cell), Some(true));
+        assert_eq!(cell_consistent((100, 40, 1007, 803), cell), Some(true));
+        assert_eq!(cell_consistent((101, 40, 1012, 810), cell), Some(true));
+        assert_eq!(cell_consistent((57, 22, 579, 441), cell), Some(true));
+        // font zoomed in (same window, fewer cells) or out (more cells)
+        assert_eq!(cell_consistent((83, 33, 1000, 800), cell), Some(false));
+        assert_eq!(cell_consistent((125, 50, 1000, 800), cell), Some(false));
+        // a DPI change: same cell counts, different pixel size
+        assert_eq!(cell_consistent((100, 40, 1500, 1200), cell), Some(false));
+        // no pixel size reported: can't say
+        assert_eq!(cell_consistent((100, 40, 0, 0), cell), None);
+        assert_eq!(cell_consistent((0, 0, 1000, 800), cell), None);
+    }
+
+    #[test]
+    fn blank_runs_merge_neighbours_and_respect_the_skip_rects() {
+        use ratatui::style::Color;
+        let (a, b) = (Color::Rgb(1, 2, 3), Color::Rgb(9, 9, 9));
+        let cells = vec![(0, 0, a), (1, 0, a), (2, 0, a), (3, 0, b), (0, 1, a), (2, 1, a)];
+        assert_eq!(blank_runs(&cells, &[]), vec![(0, 0, 3, a), (0, 3, 4, b), (1, 0, 1, a), (1, 2, 3, a)]);
+        // a skip rectangle splits a run
+        assert_eq!(blank_runs(&cells, &[Rect::new(1, 0, 1, 1)]), vec![(0, 0, 1, a), (0, 2, 3, a), (0, 3, 4, b), (1, 0, 1, a), (1, 2, 3, a)]);
+    }
+
+    /// `cargo test --release -- --ignored --nocapture preview_speed`
+    #[test]
+    #[ignore]
+    fn preview_speed() {
+        let img = ramp(256, 256);
+        for (cols, rows, cell) in [(26u16, 13u16, (10u16, 20u16)), (40, 20, (10, 20)), (60, 30, (12, 24))] {
+            let p = plan(Rect::new(0, 0, cols, rows), cell).unwrap();
+            let t = std::time::Instant::now();
+            let n = 20;
+            let mut bytes = 0;
+            for _ in 0..n {
+                bytes = encode_preview(&img, &p, cell).data.len();
+            }
+            let pv = t.elapsed() / n;
+            let big = ramp(640, 640);
+            let t = std::time::Instant::now();
+            let q = encode_image(&big, &p, cell).data.len();
+            println!("side {:>3}px: preview {:>8.2?} ({:>6} B)   quality {:>8.2?} ({:>6} B)", p.key.side, pv, bytes, t.elapsed(), q);
+        }
     }
 }

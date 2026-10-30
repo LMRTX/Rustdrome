@@ -50,7 +50,11 @@ sudo apt install mpv
 sudo dnf install mpv
 ```
 
-### Precompiled binary
+**Windows 11**
+(https://github.com/mpv-player/mpv/releases/download/git-release/mpv-v0.41.0-dev-g18091d351-40927902575-x86_64-w64-mingw32-full.zip)
+Move the `mpv.exe` file to somewhere in `Path`. For example move it to `C:\Tools\` and add that folder to the user `Path`.
+
+### Precompiled Unix binary
 
 The precompiled binary targets Unix systems with **glibc 2.39 or newer**.
 
@@ -62,10 +66,17 @@ chmod +x ./install
 ```
 Then just launch the application with `rustdrome` in your terminal.
 
+### Precompiled Windows executable
+
+The precompiled binary targets **Windows 11** and **Windows 10** systems.
+
+The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
+For convenient acess, move the executable to somewhere on your `Path` for example in to the folder `C:\Tools\` mentioned earlier.
+If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
 ## Building from Source
 
-Rustdrome requires **Rust 1.84 or newer**.
+Rustdrome requires **Rust 1.91 or newer**. If Rust is not packaged newer than 1.91 for your distribution, use `rustup` to install tool-chain.
 
 ```sh
 git clone https://github.com/LMRTX/rustdrome --branch source
@@ -203,7 +214,6 @@ Configuration files containing authentication tokens should be protected with re
 - View synced and plain lyrics.
 - Use Zen mode for a distraction-free listening experience.
 - Display album art using sixel or half-cell terminal graphics.
-- Watch the audio visualizer react to mpv's playback loudness meter.
 - Follow animated titles and the dynamic playback progress bar.
 - Copy share links using OSC 52.
 
@@ -238,9 +248,6 @@ Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
 - **Persistence:** configuration, application state, queue data, and caches are stored locally.
 - **Offline synchronization:** supported mutations are queued locally and synced when the server becomes available again.
 
-By communicating with mpv over IPC instead of linking libmpv, Rustdrome avoids requiring libmpv development headers during compilation.
-
-
 ## Differences from NaviTui
 
 Rustdrome started as a rewrite of [NaviTui](https://github.com/Gheat1/NaviTui), preserving its existing file formats and much of its functionality while changing the implementation language and terminal UI framework.
@@ -250,25 +257,7 @@ Rustdrome started as a rewrite of [NaviTui](https://github.com/Gheat1/NaviTui), 
 | Language | Python | Rust |
 | Terminal UI | Textual | ratatui |
 | Playback integration | Python bindings to libmpv | mpv child process over JSON IPC |
-| Platform support | Linux, macOS, and Windows | Unix systems for now |
 | Cover art | Multiple protocols, including Kitty graphics | Sixel or half-cell blocks |
-
-
-### Not yet implemented
-
-The following NaviTui features are not currently implemented in Rustdrome:
-
-- MPRIS and system media keys.
-- Discord Rich Presence.
-- ListenBrainz integration.
-- Remote-control CLI and MCP server.
-- Equalizer.
-- Audio-device and server-profile switchers.
-- SVG now-playing card export.
-- Jukebox mode.
-
-Corresponding `player.toml` keys are ignored.
-
 
 ## License
 
