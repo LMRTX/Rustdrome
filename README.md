@@ -50,7 +50,7 @@ sudo apt install mpv
 sudo dnf install mpv
 ```
 
-
+<br>
 **Windows**
 
 **[Github releases page](https://github.com/mpv-player/mpv/releases)**
