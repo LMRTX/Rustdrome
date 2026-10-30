@@ -50,14 +50,11 @@ sudo apt install mpv
 sudo dnf install mpv
 ```
 
-<br>
-
 **Windows**
 
 **[Github releases page](https://github.com/mpv-player/mpv/releases)**
 
 Move the `mpv.exe` file to somewhere in `Path`.
-
 For example move it to `C:\Tools\` and add that folder to the user `Path`.
 
 ### Precompiled Unix binary
