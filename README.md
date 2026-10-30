@@ -80,7 +80,7 @@ Then just launch the application with `rustdrome` in your terminal.
 
 ## Building from Source
 
-Rustdrome requires **Rust 1.91 or newer**. If Rust is not packaged newer than 1.91 for your distribution, use `rustup` to install tool-chain.
+Rustdrome requires **Rust 1.91 or newer**. If Rust is not packaged newer than 1.91 for your distribution, use `rustup` to install toolchain.
 
 ```sh
 git clone https://github.com/LMRTX/rustdrome --branch source
