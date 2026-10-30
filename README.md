@@ -33,7 +33,7 @@ Originally started out as a rewrite of the [NaviTui](https://github.com/Gheat1/N
 
 Rustdrome requires **`mpv` on your `PATH` at runtime**. It does not require libmpv development headers to build.
 
-Install mpv using your distribution's package manager:
+Install mpv using your distribution's package manager; or on Windows download it from mpv releases:
 
 **Arch Linux**
 ```sh
@@ -50,9 +50,11 @@ sudo apt install mpv
 sudo dnf install mpv
 ```
 
-**Windows 11**
-(https://github.com/mpv-player/mpv/releases/download/git-release/mpv-v0.41.0-dev-g18091d351-40927902575-x86_64-w64-mingw32-full.zip)
-Move the `mpv.exe` file to somewhere in `Path`. For example move it to `C:\Tools\` and add that folder to the user `Path`.
+**Windows**
+
+**[Github releases page](https://github.com/mpv-player/mpv/releases)**
+
+Move the `mpv.exe` file to somewhere in user `Path`.
 
 ### Precompiled Unix binary
 
@@ -68,15 +70,17 @@ Then just launch the application with `rustdrome` in your terminal.
 
 ### Precompiled Windows executable
 
-The precompiled binary targets **Windows 11** and **Windows 10** systems.
+- The precompiled binary targets **Windows 11** and **Windows 10** systems.
 
-The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
-For convenient acess, move the executable to somewhere on your `Path` for example in to the folder `C:\Tools\` mentioned earlier.
-If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
+- The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
+
+- For convenient access, move the executable to somewhere on your `Path`.
+
+- If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
 ## Building from Source
 
-Rustdrome requires **Rust 1.91 or newer**. If Rust is not packaged newer than 1.91 for your distribution, use `rustup` to install tool-chain.
+Rustdrome requires **Rust 1.91 or newer**. If Rust is not packaged newer than 1.91 for your distribution, use `rustup` to install toolchain.
 
 ```sh
 git clone https://github.com/LMRTX/rustdrome --branch source
@@ -236,8 +240,6 @@ Configuration files containing authentication tokens should be protected with re
 - Customize settings and keybindings through `player.toml`.
 - Receive desktop notifications when tracks change.
 
-
-
 ## How It Works
 
 Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
@@ -247,17 +249,6 @@ Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
 - **Music server:** Rustdrome connects to Navidrome and other Subsonic-compatible servers.
 - **Persistence:** configuration, application state, queue data, and caches are stored locally.
 - **Offline synchronization:** supported mutations are queued locally and synced when the server becomes available again.
-
-## Differences from NaviTui
-
-Rustdrome started as a rewrite of [NaviTui](https://github.com/Gheat1/NaviTui), preserving its existing file formats and much of its functionality while changing the implementation language and terminal UI framework.
-
-| Area | NaviTui | Rustdrome |
-|---|---|---|
-| Language | Python | Rust |
-| Terminal UI | Textual | ratatui |
-| Playback integration | Python bindings to libmpv | mpv child process over JSON IPC |
-| Cover art | Multiple protocols, including Kitty graphics | Sixel or half-cell blocks |
 
 ## License
 

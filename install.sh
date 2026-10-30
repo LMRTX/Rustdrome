@@ -12,7 +12,7 @@ fi
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$BINARY" "$INSTALL_DIR/rustdrome"
 
-echo "Successfully installed/updated rustdrome."
+echo "Installed/updated Rustdrome successfully ."
 
 case ":$PATH:" in
     *":$INSTALL_DIR:"*)
