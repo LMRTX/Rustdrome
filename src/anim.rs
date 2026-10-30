@@ -44,43 +44,73 @@ pub fn shimmer(text: &str, phase: f64, base: ratatui::style::Color, glow: ratatu
         .collect()
 }
 
-// ── smooth progress bar (sub-cell precision) ──────────────────────────
+// ── thin line bar (progress + volume) ─────────────────────────────────
 
-const EIGHTHS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+/// Cell (0-based) the dot sits in for `fraction` of a bar `width` cells wide:
+/// the first cell is 0 %, the last is 100 %.
+pub fn dot_index(fraction: f64, width: usize) -> usize {
+    if width <= 1 {
+        0
+    } else {
+        (fraction.clamp(0.0, 1.0) * (width - 1) as f64).round() as usize
+    }
+}
 
-/// A progress bar with 1/8-cell resolution and a gently pulsing head.
-/// `head_pulse` in [0,1] brightens the leading edge.
-pub fn smooth_bar(fraction: f64, width: usize, head_pulse: f64, th: &Theme) -> Vec<Span<'static>> {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let eighths = (fraction * width as f64 * 8.0).round() as usize;
-    let (full, rem) = (eighths / 8, eighths % 8);
-    let fill = blend(th.blue, th.lav, 0.3);
-    let head = blend(fill, th.text, 0.55 * head_pulse);
-    let mut spans = Vec::new();
-    if full > 0 {
-        if full > 1 {
-            spans.push(Span::styled("█".repeat(full - 1), Style::default().fg(fill)));
-        }
-        let c = if rem == 0 { head } else { fill };
-        spans.push(Span::styled("█", Style::default().fg(c)));
+/// The inverse of [`dot_index`]: what fraction a click on cell `col` means.
+/// Clicking the first/last cell gives exactly 0 / 1, so 0 % and 100 % are reachable.
+pub fn fraction_at(col: usize, width: usize) -> f64 {
+    if width <= 1 {
+        0.0
+    } else {
+        col.min(width - 1) as f64 / (width - 1) as f64
     }
-    if rem > 0 && full < width {
-        spans.push(Span::styled(EIGHTHS[rem - 1].to_string(), Style::default().fg(head)));
+}
+
+/// A thin line with a dot at the current point: `━━━━●────`. Exactly `width`
+/// cells. `pulse` in [0,1] brightens the dot.
+pub fn line_bar(fraction: f64, width: usize, fill: ratatui::style::Color, pulse: f64, th: &Theme) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
     }
-    let used = full + usize::from(rem > 0);
-    if used < width {
-        spans.push(Span::styled("╌".repeat(width - used), Style::default().fg(th.vfaint)));
+    let head = dot_index(fraction, width);
+    let dot = blend(fill, th.text, 0.55 * pulse.clamp(0.0, 1.0));
+    let mut spans = Vec::with_capacity(3);
+    if head > 0 {
+        spans.push(Span::styled("━".repeat(head), Style::default().fg(fill)));
+    }
+    spans.push(Span::styled("●", Style::default().fg(dot)));
+    if head + 1 < width {
+        spans.push(Span::styled("─".repeat(width - head - 1), Style::default().fg(th.vfaint)));
     }
     spans
 }
 
-/// Small blocky gauge for volume.
-pub fn mini_gauge(fraction: f64, width: usize, th: &Theme) -> Vec<Span<'static>> {
-    let lit = (fraction.clamp(0.0, 1.0) * width as f64).round() as usize;
-    vec![
-        Span::styled("▮".repeat(lit), Style::default().fg(th.lav)),
-        Span::styled("▯".repeat(width - lit), Style::default().fg(th.vfaint)),
-    ]
+// ── playhead ──────────────────────────────────────────────────────────
+
+/// How far past mpv's last report the playhead may be extrapolated. Reports
+/// stop while mpv stalls (buffering); without a cap the dot would run ahead.
+pub const MAX_EXTRAPOLATE: f64 = 0.75;
+
+/// Where the playhead is *now*. mpv's position reaches the UI only when it has
+/// moved ≥ ¼ s, but the screen redraws every ⅛ s, so drawing the report as it
+/// is makes the dot hold still for a frame and then jump two. Instead advance
+/// from the last report (`age` seconds old) at the playback `speed`.
+///
+/// `prev` is what was drawn last frame: a report that lands a hair behind the
+/// extrapolation (< ½ s) doesn't pull the dot backwards; a real seek back does.
+/// Not running (paused / stopped) shows the report exactly.
+pub fn playhead(reported: f64, age: f64, speed: f64, running: bool, duration: f64, prev: f64) -> f64 {
+    if !running {
+        return reported;
+    }
+    let mut p = reported + age.clamp(0.0, MAX_EXTRAPOLATE) * speed.max(0.0);
+    if duration > 0.0 {
+        p = p.min(duration);
+    }
+    if p < prev && prev - p < 0.5 {
+        p = prev;
+    }
+    p
 }
 
 // ── marquee ───────────────────────────────────────────────────────────
@@ -183,14 +213,70 @@ mod tests {
     }
 
     #[test]
-    fn smooth_bar_has_exact_width() {
+    fn line_bar_has_exact_width_and_one_dot() {
         let th = crate::theme::by_name("mocha");
-        for pct in [0.0, 0.013, 0.5, 0.999, 1.0] {
-            let w: usize = smooth_bar(pct, 30, 0.0, &th)
-                .iter()
-                .map(|s| s.content.width())
-                .sum();
-            assert_eq!(w, 30, "at {pct}");
+        for width in [0usize, 1, 2, 3, 30] {
+            for pct in [0.0, 0.013, 0.5, 0.999, 1.0, 7.0, -1.0] {
+                let spans = line_bar(pct, width, th.lav, 0.0, &th);
+                let w: usize = spans.iter().map(|s| s.content.width()).sum();
+                assert_eq!(w, width, "width {width} at {pct}");
+                let dots: usize = spans.iter().map(|s| s.content.matches('●').count()).sum();
+                assert_eq!(dots, usize::from(width > 0), "width {width} at {pct}");
+            }
         }
     }
+
+    #[test]
+    fn playhead_moves_at_a_constant_rate_between_quarter_second_reports() {
+        // mpv reports at 0.25 s steps of *its* position; the UI draws every 0.125 s
+        let (mut prev, mut last_frame) = (0.0, 0.0);
+        let mut t = 0.0;
+        while t < 20.0 {
+            let reported = (t / 0.25_f64).floor() * 0.25;
+            let shown = playhead(reported, t - reported, 1.0, true, 0.0, prev);
+            assert!((shown - t).abs() < 1e-9, "t={t}: shown {shown}");
+            if t > 0.0 {
+                assert!((shown - last_frame - 0.125).abs() < 1e-9, "uneven step at t={t}");
+            }
+            (prev, last_frame) = (shown, shown);
+            t += 0.125;
+        }
+        // …whereas drawing the raw report alternates between standing still and jumping
+        let raw: Vec<f64> = (0..8).map(|i| ((i as f64 * 0.125) / 0.25).floor() * 0.25).collect();
+        let steps: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().any(|s| *s == 0.0) && steps.iter().any(|s| *s == 0.25));
+    }
+
+    #[test]
+    fn playhead_follows_speed_stops_when_paused_and_never_runs_away() {
+        assert_eq!(playhead(10.0, 0.2, 2.0, true, 0.0, 0.0), 10.4);
+        assert_eq!(playhead(10.0, 0.2, 1.0, false, 0.0, 0.0), 10.0, "paused shows the report exactly");
+        assert_eq!(playhead(10.0, 0.2, 1.0, false, 0.0, 10.3), 10.0, "…even if the last frame was ahead");
+        assert_eq!(playhead(10.0, 30.0, 1.0, true, 0.0, 0.0), 10.0 + MAX_EXTRAPOLATE, "a stalled mpv can't be outrun");
+        assert_eq!(playhead(99.9, 0.7, 1.0, true, 100.0, 0.0), 100.0, "never past the end");
+        assert_eq!(playhead(10.0, -1.0, 1.0, true, 0.0, 0.0), 10.0, "a clock hiccup can't go negative");
+    }
+
+    #[test]
+    fn playhead_ignores_small_regressions_but_not_seeks() {
+        assert_eq!(playhead(10.0, 0.0, 1.0, true, 0.0, 10.3), 10.3, "report a hair behind the extrapolation");
+        assert_eq!(playhead(5.0, 0.0, 1.0, true, 0.0, 10.3), 5.0, "a real seek back wins");
+        assert_eq!(playhead(10.0, 0.1, 1.0, true, 0.0, 9.0), 10.1, "forward is always accepted");
+    }
+
+    #[test]
+    fn dot_sits_at_the_ends_and_clicks_invert_it() {
+        assert_eq!(dot_index(0.0, 30), 0);
+        assert_eq!(dot_index(1.0, 30), 29);
+        assert_eq!(dot_index(0.5, 11), 5);
+        assert_eq!(fraction_at(0, 30), 0.0);
+        assert_eq!(fraction_at(29, 30), 1.0);
+        assert_eq!(fraction_at(99, 30), 1.0); // past the end stays in range
+        for width in 2..60 {
+            for col in 0..width {
+                assert_eq!(dot_index(fraction_at(col, width), width), col, "width {width} col {col}");
+            }
+        }
+    }
+
 }

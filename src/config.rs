@@ -429,7 +429,7 @@ const TEMPLATE: &str = r#"# Rustdrome player settings — restart the app after 
 #notifications = true
 
 # Tint the UI with a color pulled from the current song's cover art.
-# Truecolor terminals only; the "system" (ANSI) theme leaves this inert.
+# Truecolor terminals only; the "system" (ANSI), "ice clear" and "tiger clear" themes leave this inert.
 #art_theming = true
 
 # ReplayGain fine-tuning (in dB). preamp is applied on top of the ReplayGain

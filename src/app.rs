@@ -131,14 +131,30 @@ pub struct Moving {
     pub y: u16,
 }
 
+/// What a held left button is dragging on the now-playing box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scrub {
+    /// the seek line: the track follows the pointer
+    Seek,
+    /// the volume slider
+    Volume,
+}
+
+/// One notch of the mouse wheel over the volume control / the seek line.
+/// Both match the keyboard (`volume_up`/`volume_down`, `seek_forward`/`seek_back`).
+pub const WHEEL_VOLUME: i64 = 5;
+pub const WHEEL_SEEK: f64 = 5.0;
+
 /// Screen regions from the last draw, for mouse hit-testing.
 #[derive(Default, Clone)]
 pub struct Rects {
     pub sidebar: Rect,
     pub tracks: Rect,
     pub queue: Rect,
-    pub bar: Rect,      // seek bar (1 row)
-    pub gauge: Rect,    // volume gauge
+    pub bar: Rect,      // the seek line (click to seek)
+    pub seek: Rect,     // the whole elapsed/line/total row (wheel to seek)
+    pub gauge: Rect,    // the volume slider (click to set)
+    pub vol: Rect,      // speaker icon through the percentage (wheel to change volume)
     pub shuffle: Rect,
     pub repeat: Rect,
     /// the area the panels fill, and where the layout put each panel / divider
@@ -184,6 +200,18 @@ pub struct App {
     pub queue: PlayQueue,
     pub now_song: Option<Song>,
     pub now_position: f64,
+    /// mpv's last position report and when it arrived; the dot is extrapolated
+    /// from it between reports (see `anim::playhead`). `None` = no report yet for this track.
+    pub pos_report: Option<(f64, Instant)>,
+    /// what the bar drew last frame (so a late report can't pull it back a hair)
+    pub shown_pos: f64,
+    /// after our own seek, reports that predate it are ignored until this passes
+    pub seek_hold: Option<Instant>,
+    /// a held left button on the seek line / volume slider, and where a seek would land
+    pub scrub: Option<Scrub>,
+    pub scrub_frac: f64,
+    pub scrub_sent: Option<Instant>,
+    pub scrub_dirty: bool,
     pub now_duration: f64,
 
     // library
@@ -334,6 +362,13 @@ impl App {
             queue,
             now_song,
             now_position: resume_position,
+            pos_report: None,
+            shown_pos: resume_position,
+            seek_hold: None,
+            scrub: None,
+            scrub_frac: 0.0,
+            scrub_sent: None,
+            scrub_dirty: false,
             now_duration,
             view,
             songs: vec![],
@@ -628,6 +663,7 @@ impl App {
         self.title_flash = self.title_flash.saturating_sub(1);
         self.vol_flash = self.vol_flash.saturating_sub(1);
         self.speed_flash = self.speed_flash.saturating_sub(1);
+        self.flush_scrub(false);
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
         if let Some(deadline) = self.sleep_deadline {
@@ -770,24 +806,36 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if self.modal.is_some() {
+            self.scrub = None; // a modal can swallow the button release
             return;
         }
         let (x, y) = (m.column, m.row);
         let hit = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                let d = if matches!(m.kind, MouseEventKind::ScrollDown) { 3 } else { -3 };
-                for (rect, f) in [(self.rects.sidebar, Focus::Sidebar), (self.rects.tracks, Focus::Tracks), (self.rects.queue, Focus::Queue)] {
-                    if hit(rect) {
-                        let prev = self.focus;
-                        self.focus = f;
-                        self.move_cursor(d);
-                        self.focus = prev;
+                let up = matches!(m.kind, MouseEventKind::ScrollUp);
+                if hit(self.rects.vol) {
+                    // same step as the keyboard's volume keys
+                    self.change_volume(if up { WHEEL_VOLUME } else { -WHEEL_VOLUME });
+                } else if hit(self.rects.seek) {
+                    self.player.seek(if up { WHEEL_SEEK } else { -WHEEL_SEEK });
+                } else {
+                    let d = if up { -3 } else { 3 };
+                    for (rect, f) in [(self.rects.sidebar, Focus::Sidebar), (self.rects.tracks, Focus::Tracks), (self.rects.queue, Focus::Queue)] {
+                        if hit(rect) {
+                            let prev = self.focus;
+                            self.focus = f;
+                            self.move_cursor(d);
+                            self.focus = prev;
+                        }
                     }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(mv) = &mut self.moving {
+                if let Some(kind) = self.scrub {
+                    // follows the pointer's column, wherever it has wandered vertically
+                    self.scrub_to(kind, x);
+                } else if let Some(mv) = &mut self.moving {
                     mv.x = x;
                     mv.y = y;
                 } else if let Some(d) = self.drag {
@@ -799,7 +847,10 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(mut mv) = self.moving.take() {
+                if let Some(kind) = self.scrub {
+                    self.scrub_to(kind, x);
+                    self.end_scrub();
+                } else if let Some(mut mv) = self.moving.take() {
                     mv.x = x;
                     mv.y = y;
                     self.finish_move(mv);
@@ -833,9 +884,11 @@ impl App {
                     return;
                 }
                 if hit(r.bar) && r.bar.width > 0 {
-                    self.seek_fraction((x - r.bar.x) as f64 / r.bar.width as f64 + 0.5 / r.bar.width as f64);
+                    self.scrub = Some(Scrub::Seek);
+                    self.scrub_to(Scrub::Seek, x);
                 } else if hit(r.gauge) && r.gauge.width > 0 {
-                    self.set_volume_fraction((x - r.gauge.x) as f64 / r.gauge.width as f64 + 0.5 / r.gauge.width as f64);
+                    self.scrub = Some(Scrub::Volume);
+                    self.scrub_to(Scrub::Volume, x);
                 } else if hit(r.shuffle) {
                     self.do_action(Action::Shuffle);
                 } else if hit(r.repeat) {

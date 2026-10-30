@@ -165,7 +165,7 @@ impl App {
                 self.queue.clear();
                 self.player.stop();
                 self.now_song = None;
-                self.now_position = 0.0;
+                self.set_position(0.0);
                 self.now_duration = 0.0;
                 self.queue_state.select(None);
                 self.persist_queue(None);
@@ -873,7 +873,7 @@ impl App {
         if self.now_song.as_ref().map(|s| &s.id) != Some(&song.id) {
             self.title_flash = 12;
         }
-        self.now_position = resume_at;
+        self.set_position(resume_at);
         self.now_duration = song.duration as f64;
         self.now_song = Some(song.clone());
         self.scrobbled = false;
@@ -902,7 +902,7 @@ impl App {
         }
     }
 
-    fn change_volume(&mut self, delta: i64) {
+    pub fn change_volume(&mut self, delta: i64) {
         let v = self.player.volume() + delta;
         self.player.set_volume(v);
         self.vol_flash = 10;
@@ -913,8 +913,68 @@ impl App {
         self.vol_flash = 10;
     }
 
+    /// Length of the current track: mpv's figure once it knows it, else the server's.
+    pub fn track_duration(&self) -> f64 {
+        if self.now_duration > 0.0 {
+            self.now_duration
+        } else {
+            self.now_song.as_ref().map_or(0.0, |s| s.duration as f64)
+        }
+    }
+
     pub fn seek_fraction(&mut self, f: f64) {
-        self.player.seek_to(f.clamp(0.0, 1.0));
+        let f = f.clamp(0.0, 1.0);
+        self.player.seek_to(f);
+        // show where we are going at once instead of waiting for mpv's report
+        let d = self.track_duration();
+        if self.player.active() && d > 0.0 {
+            let target = f.min(0.99) * d;
+            self.now_position = target;
+            self.shown_pos = target;
+            self.pos_report = Some((target, Instant::now()));
+            self.seek_hold = Some(Instant::now() + Duration::from_millis(400));
+        }
+    }
+
+    /// The pointer is at screen column `x` while the button is held on the seek
+    /// line or the volume slider (the column is clamped to the control's ends).
+    pub fn scrub_to(&mut self, kind: Scrub, x: u16) {
+        let r = if kind == Scrub::Seek { self.rects.bar } else { self.rects.gauge };
+        if r.width == 0 {
+            return;
+        }
+        let col = x.clamp(r.x, r.x + r.width - 1) - r.x;
+        let f = crate::anim::fraction_at(col as usize, r.width as usize);
+        match kind {
+            Scrub::Volume => self.set_volume_fraction(f),
+            Scrub::Seek => {
+                if f != self.scrub_frac || !self.scrub_dirty && self.scrub_sent.is_none() {
+                    self.scrub_frac = f;
+                    self.scrub_dirty = true;
+                }
+                self.flush_scrub(false);
+            }
+        }
+    }
+
+    /// Send the pending scrub position to mpv — at most every 50 ms while dragging
+    /// (`force` for the final one on release).
+    pub fn flush_scrub(&mut self, force: bool) {
+        if self.scrub != Some(Scrub::Seek) || !self.scrub_dirty {
+            return;
+        }
+        if force || self.scrub_sent.is_none_or(|t| t.elapsed() >= Duration::from_millis(50)) {
+            self.scrub_dirty = false;
+            self.scrub_sent = Some(Instant::now());
+            self.seek_fraction(self.scrub_frac);
+        }
+    }
+
+    pub fn end_scrub(&mut self) {
+        self.flush_scrub(true);
+        self.scrub = None;
+        self.scrub_sent = None;
+        self.scrub_dirty = false;
     }
 
     fn cycle_sleep(&mut self) {
@@ -947,8 +1007,25 @@ impl App {
         self.info("sleep timer — paused");
     }
 
+    /// Put the position somewhere that mpv hasn't reported (a reset, a resume point):
+    /// nothing is extrapolated from it until the first real report arrives.
+    pub fn set_position(&mut self, p: f64) {
+        self.now_position = p;
+        self.shown_pos = p;
+        self.pos_report = None;
+    }
+
     pub fn on_position(&mut self, position: f64, duration: f64) {
+        // right after our own seek, reports from before it are still in flight:
+        // taking one would snap the dot back for a moment
+        if let Some(until) = self.seek_hold {
+            if Instant::now() < until && (position - self.now_position).abs() > 1.5 {
+                return;
+            }
+            self.seek_hold = None;
+        }
         self.now_position = position;
+        self.pos_report = Some((position, Instant::now()));
         if duration > 0.0 {
             self.now_duration = duration;
         }
@@ -987,7 +1064,7 @@ impl App {
             self.sleep_idx = 0;
             self.sleep_label.clear();
             self.player.stop();
-            self.now_position = 0.0;
+            self.set_position(0.0);
             self.info("sleep timer — stopped at end of track");
             return;
         }
@@ -999,7 +1076,7 @@ impl App {
             self.radio_refill(seed, true);
         } else {
             self.player.stop();
-            self.now_position = 0.0;
+            self.set_position(0.0);
             self.now_duration = 0.0;
         }
     }
@@ -1054,7 +1131,7 @@ impl App {
         if songs.is_empty() {
             if autoplay {
                 self.player.stop();
-                self.now_position = 0.0;
+                self.set_position(0.0);
                 self.info("radio: no more tracks to play");
             }
             return;
@@ -1449,7 +1526,7 @@ impl App {
         let m = self.rects.main;
         if m.width > 0 && (w > m.width || h > m.height) {
             self.notify(
-                format!("{what} needs at least {}×{} — this terminal is {}×{}", w, h + 6, m.width, m.height + 6),
+                format!("{what} needs at least {}×{} — this terminal is {}×{}", w, h + crate::ui::CHROME_ROWS, m.width, m.height + crate::ui::CHROME_ROWS),
                 Level::Warn,
             );
             return false;

@@ -18,7 +18,9 @@ use crate::theme::Theme;
 
 /// Rows taken by everything that isn't a panel: the top bar, the 4-row
 /// now-playing box and the footer.
-const CHROME_ROWS: u16 = 6;
+pub const CHROME_ROWS: u16 = 1 + NOW_ROWS + 1;
+/// Height of the now-playing box: its border and two lines.
+const NOW_ROWS: u16 = 4;
 /// Zen mode has no panels, so it needs far less width — but the cover plus its
 /// nine rows of text, plus the bars above and below.
 pub const MIN_SIZE_ZEN: (u16, u16) = (30, 20);
@@ -49,9 +51,31 @@ const REPEAT: &str = "\u{f01e}";
 const SPEED: &str = "\u{f0e4}";
 const MOON: &str = "\u{f186}";
 const STAR: &str = "\u{f005}";
-const CHECK: &str = "\u{f00c}";
+// speaker glyphs (Nerd Font Material Design set): muted, low, medium, high
+const VOL_MUTE: &str = "\u{f075f}";
+const VOL_LOW: &str = "\u{f057f}";
+const VOL_MED: &str = "\u{f0580}";
+const VOL_HIGH: &str = "\u{f057e}";
+
+/// Which of the four speaker icons shows for a volume: muted (or 0), then
+/// thirds of the 0–100 range (anything louder than 100 counts as max).
+fn vol_icon(vol: i64, muted: bool) -> &'static str {
+    match (muted, vol) {
+        (true, _) | (_, ..=0) => VOL_MUTE,
+        (_, 1..=33) => VOL_LOW,
+        (_, 34..=66) => VOL_MED,
+        _ => VOL_HIGH,
+    }
+}
+const DOWNLOAD: &str = "\u{f019}";
 const CHECK_CIRCLE: &str = "\u{f058}";
-const LIST_ICON: &str = "\u{f03a}";
+const ALL_TRACKS: &str = "\u{f188e}";
+const PLAYLIST: &str = "\u{f0cb8}";
+// library categories: recently added / recently played / most played
+const NEW_ICON: &str = "\u{f271}";
+const HISTORY: &str = "\u{f1da}";
+const MOST_PLAYED: &str = "\u{f080}";
+const QUALITY: &str = "\u{f012}";
 const PLUS: &str = "\u{f067}";
 const PLUG: &str = "\u{f1e6}";
 const FILTER: &str = "\u{f0b0}";
@@ -150,7 +174,14 @@ fn panel<'a>(title: &str, subtitle: Option<String>, focused: bool, th: &Theme) -
         .border_style(Style::default().fg(color))
         .title(Span::styled(format!(" {title} "), Style::default().fg(if focused { th.lav } else { th.dim })));
     if let Some(s) = subtitle {
-        b = b.title_bottom(Line::from(Span::styled(format!(" {s} "), Style::default().fg(th.dim))).right_aligned());
+        let mut spans = vec![Span::styled(" ", Style::default().fg(th.dim))];
+        let mut rest = s.as_str();
+        if let Some(g) = rest.chars().next().filter(|c| [FILTER, CHECK_CIRCLE].iter().any(|i| i.starts_with(*c))) {
+            spans.push(Span::styled(g.to_string(), Style::default().fg(th.blue)));
+            rest = &rest[g.len_utf8()..];
+        }
+        spans.push(Span::styled(format!("{rest} "), Style::default().fg(th.dim)));
+        b = b.title_bottom(Line::from(spans).right_aligned());
     }
     b
 }
@@ -185,8 +216,27 @@ fn windowed_list<'a>(
     let items: Vec<ListItem> = (off..end).map(&row).collect();
     let mut local = ListState::default();
     local.select(sel.filter(|s| (off..end).contains(s)).map(|s| s - off));
-    let hl = if focused { Style::default().bg(th.cursor) } else { Style::default().bg(th.vfaint) };
-    f.render_stateful_widget(List::new(items).highlight_style(hl), area, &mut local);
+    f.render_stateful_widget(List::new(items), area, &mut local);
+    // The selected row is marked by its text only — bold and in the theme colour —
+    // never by a background, so the panel looks the same under the cursor.
+    if let Some(r) = local.selected() {
+        let row = Rect::new(area.x, area.y + r as u16, area.width, 1).intersection(area);
+        let bold = ratatui::style::Modifier::BOLD;
+        if focused {
+            f.buffer_mut().set_style(row, Style::default().fg(th.blue).add_modifier(bold));
+        } else {
+            // unfocused: bold light text, but accent-coloured cells (the icons) stay as they are
+            let buf = f.buffer_mut();
+            for x in row.x..row.x + row.width {
+                if let Some(c) = buf.cell_mut((x, row.y)) {
+                    if c.fg != th.blue {
+                        c.set_fg(th.sub);
+                    }
+                    c.modifier.insert(bold);
+                }
+            }
+        }
+    }
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -210,7 +260,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(4), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(NOW_ROWS), Constraint::Length(1)])
         .split(area);
 
     draw_topbar(f, app, rows[0], &th);
@@ -280,10 +330,10 @@ fn draw_topbar(f: &mut Frame, app: &App, area: Rect, th: &Theme) {
         right.push(Span::styled("private  ", th.bold(th.mauve)));
     }
     if app.offline {
-        right.push(Span::styled(format!("{PLUG} offline  "), th.fg(th.yellow)));
+        right.push(Span::styled(format!("{PLUG} offline  "), th.fg(th.blue)));
     }
     if app.quality_now.0 > 0 {
-        right.push(Span::styled(format!("\u{f012} {}k  ", app.quality_now.0), th.fg(th.yellow)));
+        right.push(Span::styled(format!("{QUALITY} {}k  ", app.quality_now.0), th.fg(th.blue)));
     }
     if app.radio {
         right.push(Span::styled(format!("{RADIO} radio  "), th.fg(th.blue)));
@@ -409,24 +459,28 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             SideRow::Header(h) => Line::from(Span::styled(format!(" {h}"), th.bold(th.dim))),
             SideRow::Spacer => Line::from(" "),
             SideRow::View { id, label } => {
-                let (glyph, color) = match *id {
-                    "shuffle-all" => (SHUFFLE, th.peach),
-                    "starred" => (STAR, th.yellow),
-                    _ => ("◍", th.mauve),
+                let glyph = match *id {
+                    "all-songs" => ALL_TRACKS,
+                    "shuffle-all" => SHUFFLE,
+                    "starred" => STAR,
+                    "newest" => NEW_ICON,
+                    "recent" => HISTORY,
+                    "frequent" => MOST_PLAYED,
+                    _ => "◍",
                 };
+                let color = th.blue;
                 let name = if *id == cur_view { th.bold(th.text) } else { th.fg(th.text) };
                 Line::from(vec![Span::styled(format!(" {glyph} "), th.fg(color)), Span::styled(label.to_string(), name)])
             }
             SideRow::Playlist(p) => Line::from(vec![
-                Span::styled(format!(" {LIST_ICON} "), th.fg(th.lav)),
+                Span::styled(format!(" {PLAYLIST} "), th.fg(th.blue)),
                 Span::styled(p.name.clone(), th.fg(th.text)),
-                Span::styled(format!(" {}♪", p.song_count), th.fg(th.vfaint)),
             ]),
             SideRow::NewPlaylist => {
-                Line::from(vec![Span::styled(format!(" {PLUS} "), th.fg(th.green)), Span::styled("new playlist", th.fg(th.sub))])
+                Line::from(vec![Span::styled(format!(" {PLUS} "), th.fg(th.blue)), Span::styled("new playlist", th.fg(th.sub))])
             }
             SideRow::Podcast(c, n) => Line::from(vec![
-                Span::styled(format!(" {PODCAST} "), th.fg(th.green)),
+                Span::styled(format!(" {PODCAST} "), th.fg(th.blue)),
                 Span::styled(c.title.clone(), th.fg(th.text)),
                 Span::styled(format!(" {n}"), th.fg(th.vfaint)),
             ]),
@@ -479,7 +533,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         let is_cur = current.as_deref() == Some(s.id.as_str());
         let mut spans = vec![];
         if selected.contains(&s.id) {
-            spans.push(Span::styled(format!(" {CHECK_CIRCLE} "), th.fg(th.green)));
+            spans.push(Span::styled(format!(" {CHECK_CIRCLE} "), th.fg(th.blue)));
         } else {
             spans.push(Span::styled(
                 format!(" {} ", if is_cur { "♪" } else { "·" }),
@@ -488,16 +542,10 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         }
         spans.push(Span::styled(s.title.clone(), if is_cur { th.bold(th.blue) } else { th.fg(th.text) }));
         if client.as_ref().is_some_and(|c| c.is_pinned(&s.id)) {
-            spans.push(Span::styled(format!(" {CHECK}"), th.fg(th.green)));
+            spans.push(Span::styled(format!(" {DOWNLOAD}"), th.fg(th.blue)));
         }
         if s.starred {
-            spans.push(Span::styled(format!(" {STAR}"), th.fg(th.yellow)));
-        }
-        if (1..=5).contains(&s.user_rating) {
-            spans.push(Span::styled(
-                format!(" {}", char::from_u32(0x2460 + s.user_rating as u32 - 1).unwrap_or('•')),
-                th.fg(th.peach),
-            ));
+            spans.push(Span::styled(format!(" {STAR}"), th.fg(th.blue)));
         }
         spans.push(Span::styled(format!("  {}", s.artist), th.fg(th.dim)));
         if s.duration > 0 {
@@ -593,7 +641,8 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
     app.rects.queue = area;
     let songs = &app.queue.songs;
     let idx = app.queue.index;
-    let running = app.player.active() && !app.player.paused();
+    // same state as the icon on the now-playing line
+    let playing = app.player.active() && !app.player.paused();
     let row = |i: usize| -> ListItem<'static> {
         let s = &songs[i];
         let ii = i as i64;
@@ -605,7 +654,7 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             ])
         } else if ii == idx {
             Line::from(vec![
-                Span::styled(format!("{} ", if running { PLAY } else { PAUSE }), th.fg(th.green)),
+                Span::styled(format!(" {} ", if playing { PLAY } else { PAUSE }), th.fg(th.blue)),
                 Span::styled(s.title.clone(), th.bold(th.blue)),
                 Span::styled(format!("  {}", s.artist), th.fg(th.dim)),
             ])
@@ -622,6 +671,13 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
 }
 
 fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
+    app.rects.bar = Rect::default();
+    app.rects.seek = Rect::default();
+    app.rects.gauge = Rect::default();
+    app.rects.vol = Rect::default();
+    app.rects.shuffle = Rect::default();
+    app.rects.repeat = Rect::default();
+
     let playing = app.player.active() && !app.player.paused();
     let border = if playing { th.border_alt } else { th.border };
     let block = Block::default()
@@ -629,15 +685,70 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
         .border_type(th.bt)
         .border_style(Style::default().fg(border))
         .title(Span::styled(" now playing ", th.fg(th.dim)));
-    let inner = block.inner(area);
+    let below = block.inner(area);
     f.render_widget(block, area);
-    if inner.height < 2 {
+    // one column of padding inside the border on each side
+    let inner = Rect::new(below.x + 1, below.y, below.width.saturating_sub(2), below.height);
+    if inner.height < 2 || inner.width < 8 {
         return;
     }
     let width = inner.width as usize;
+    let (y1, y2) = (inner.y, inner.y + 1);
 
-    // ── top line ──
-    let mut top: Vec<Span> = vec![Span::raw(" ")];
+    let dur = app.track_duration();
+    // while the seek line is held the dot follows the pointer; otherwise it is
+    // extrapolated between mpv's quarter-second reports so it moves evenly
+    let pos = if app.scrub == Some(crate::app::Scrub::Seek) {
+        app.scrub_frac * dur
+    } else if let Some((reported, at)) = app.pos_report {
+        anim::playhead(reported, at.elapsed().as_secs_f64(), app.player.speed(), playing, dur, app.shown_pos)
+    } else {
+        app.now_position
+    };
+    app.shown_pos = pos;
+    let muted = app.player.muted();
+    let vol = app.player.volume();
+    let vol_frac = if muted { 0.0 } else { vol as f64 / 100.0 };
+    let pulse = if playing { ((app.tick as f64 * 0.55).sin() + 1.0) / 2.0 } else { 0.0 };
+    let w_of = |v: &[Span]| -> usize { v.iter().map(|s| s.content.width()).sum() };
+
+    // ── top line, right side: shuffle  repeat  🔊 ───── 100% ──
+    // fixed part: "⇆ ⟳¹" + 2 gap + icon + gap + " " + "100%" = 15 cells; the slider takes what is left
+    const SLIDER_MAX: usize = 12;
+    const LEFT_MIN: usize = 10;
+    let slider_w = width.saturating_sub(15 + 1 + LEFT_MIN).min(SLIDER_MAX);
+    let slider_w = if slider_w < 3 { 0 } else { slider_w };
+
+    let mut right: Vec<Span> = vec![Span::styled(format!("{SHUFFLE} "), th.fg(if app.queue.shuffle { th.blue } else { th.vfaint }))];
+    let rep_start = w_of(&right);
+    let rep_on = if app.queue.repeat != Repeat::Off { th.blue } else { th.vfaint };
+    right.push(Span::styled(REPEAT, th.fg(rep_on)));
+    // always one cell after the glyph: the ¹ of repeat-one, else a gap (Nerd-font
+    // glyphs often draw wider than their width of 1 and would touch what follows)
+    right.push(Span::styled(if app.queue.repeat == Repeat::One { "¹" } else { " " }, th.fg(th.blue)));
+    let rep_end = w_of(&right);
+    right.push(Span::raw("  "));
+
+    let flash = if app.vol_flash > 0 && th.can_blend() { app.vol_flash as f64 / 14.0 } else { 0.0 };
+    let lit = crate::theme::blend(th.lav, ratatui::style::Color::Rgb(255, 255, 255), flash);
+    let icon_lit = crate::theme::blend(th.blue, ratatui::style::Color::Rgb(255, 255, 255), flash);
+    let vol_start = w_of(&right);
+    right.push(Span::styled(format!("{} ", vol_icon(vol, muted)), th.fg(if muted { th.red } else { icon_lit })));
+    let gauge_start = w_of(&right);
+    if slider_w > 0 {
+        right.extend(anim::line_bar(vol_frac, slider_w, lit, flash, th));
+        right.push(Span::raw(" "));
+    }
+    let pct = if muted { "mute".to_string() } else { format!("{vol}%") };
+    right.push(Span::styled(format!("{pct:>4}"), th.fg(if muted { th.red } else { th.dim })));
+    let vol_end = w_of(&right);
+    let right_w = vol_end.min(width);
+    let rx = inner.x + (width - right_w) as u16;
+    f.render_widget(Paragraph::new(Line::from(right)), Rect::new(rx, y1, right_w as u16, 1));
+
+    // ── top line, left side: what is playing ──
+    let left_w = width.saturating_sub(right_w + 1);
+    let mut top: Vec<Span> = vec![];
     match &app.now_song {
         None => {
             top.push(Span::styled("nothing playing", th.fg(th.dim)));
@@ -646,88 +757,52 @@ fn draw_now(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
             top.push(Span::styled(" on a track", th.fg(th.vfaint)));
         }
         Some(song) => {
-            top.push(Span::styled(format!("{} ", if playing { PLAY } else { PAUSE }), th.fg(if playing { th.green } else { th.peach })));
+            top.push(Span::styled(format!("{} ", if playing { PLAY } else { PAUSE }), th.fg(th.blue)));
             let mut badges: Vec<Span> = vec![];
             if (app.player.speed() - 1.0).abs() > 1e-3 {
-                let mut c = th.mauve;
+                let mut c = th.blue;
                 if app.speed_flash > 0 && th.can_blend() {
                     c = crate::theme::blend(c, ratatui::style::Color::Rgb(255, 255, 255), app.speed_flash as f64 / 12.0);
                 }
                 badges.push(Span::styled(format!(" {SPEED}{}x", app.player.speed()), th.fg(c)));
             }
             if !app.sleep_label.is_empty() {
-                badges.push(Span::styled(format!(" {MOON}{}", app.sleep_label), th.fg(th.lav)));
+                badges.push(Span::styled(format!(" {MOON}{}", app.sleep_label), th.fg(th.blue)));
             }
             let badge_w: usize = badges.iter().map(|s| s.content.width()).sum();
             let star = if song.starred { format!(" {STAR}") } else { String::new() };
             let used: usize = top.iter().map(|s| s.content.width()).sum();
-            let room = width.saturating_sub(used + star.width() + badge_w + 1).max(8);
+            let room = left_w.saturating_sub(used + star.width() + badge_w).max(8);
             let body = format!("{}  —  {} · {}", song.title, song.artist, song.album);
             let flash = app.title_flash as f64 / 12.0;
             let tc = crate::theme::blend(th.text, ratatui::style::Color::Rgb(255, 255, 255), 0.7 * flash);
             top.push(Span::styled(anim::marquee(&body, room, app.tick / 2), th.bold(tc)));
             if !star.is_empty() {
-                top.push(Span::styled(star, th.fg(th.yellow)));
+                top.push(Span::styled(star, th.fg(th.blue)));
             }
             top.extend(badges);
         }
     }
-    f.render_widget(Paragraph::new(Line::from(top)), Rect::new(inner.x, inner.y, inner.width, 1));
+    f.render_widget(Paragraph::new(Line::from(top)), Rect::new(inner.x, y1, left_w as u16, 1));
 
-    // ── bottom line ──
-    let pos = app.now_position;
-    let dur = if app.now_duration > 0.0 { app.now_duration } else { app.now_song.as_ref().map_or(0.0, |s| s.duration as f64) };
-    let times = format!(" {} / {} ", anim::fmt_time(pos), anim::fmt_time(dur));
-    let muted = app.player.muted();
-    let vol = app.player.volume();
-    let vol_frac = if muted { 0.0 } else { vol as f64 / 100.0 };
-
-    let mut right: Vec<Span> = vec![Span::raw("  "), Span::styled("vol ", th.fg(th.vfaint))];
-    let gauge_start = 2 + 4;
-    let mut gauge = anim::mini_gauge(vol_frac, 6, th);
-    if app.vol_flash > 0 && th.can_blend() {
-        let c = crate::theme::blend(th.lav, ratatui::style::Color::Rgb(255, 255, 255), app.vol_flash as f64 / 14.0);
-        for s in &mut gauge {
-            s.style = s.style.fg(c);
-        }
-    }
-    right.extend(gauge);
-    let gauge_end = gauge_start + 6;
-    right.push(Span::styled(
-        format!(" {}", if muted { "mut".to_string() } else { format!("{vol:>3}") }),
-        th.fg(if muted { th.red } else { th.dim }),
-    ));
-    right.push(Span::raw("  "));
-    let shuf_start: usize = right.iter().map(|s| s.content.width()).sum();
-    right.push(Span::styled(format!("{SHUFFLE} "), th.fg(if app.queue.shuffle { th.peach } else { th.vfaint })));
-    let rep_start: usize = right.iter().map(|s| s.content.width()).sum();
-    right.push(Span::styled(REPEAT, th.fg(if app.queue.repeat != Repeat::Off { th.peach } else { th.vfaint })));
-    if app.queue.repeat == Repeat::One {
-        right.push(Span::styled("¹", th.fg(th.peach)));
-    }
-    let rep_end: usize = right.iter().map(|s| s.content.width()).sum();
-    // Nerd-font glyphs are width 1 to us but often draw wider; without a gap
-    // after the last one it bleeds into the box's right border.
-    right.push(Span::raw("  "));
-    let right_w = rep_end + 2;
-
-    let bar_w = width.saturating_sub(times.width() + right_w).max(4);
+    // ── bottom line: elapsed ───── total ──
+    let (pos_s, dur_s) = (anim::fmt_time(pos), anim::fmt_time(dur));
+    let tw = pos_s.width().max(dur_s.width()).max(4);
+    let bar_w = width.saturating_sub(2 * tw + 2);
     let frac = if dur > 0.0 { pos / dur } else { 0.0 };
-    let pulse = if playing { ((app.tick as f64 * 0.55).sin() + 1.0) / 2.0 } else { 0.0 };
-    let mut line = anim::smooth_bar(frac, bar_w, pulse, th);
-    line.push(Span::styled(times.clone(), th.fg(th.dim)));
-    let base = bar_w + times.width();
-    line.extend(right);
-    let y = inner.y + 1;
-    f.render_widget(Paragraph::new(Line::from(line)), Rect::new(inner.x, y, inner.width, 1));
+    let fill = crate::theme::blend(th.blue, th.lav, 0.3);
+    let mut line = vec![Span::styled(format!("{pos_s:<tw$} "), th.fg(th.dim))];
+    line.extend(anim::line_bar(frac, bar_w, fill, pulse, th));
+    line.push(Span::styled(format!(" {dur_s:>tw$}"), th.fg(th.dim)));
+    f.render_widget(Paragraph::new(Line::from(line)), Rect::new(inner.x, y2, inner.width, 1));
 
     // hit-boxes for the mouse
-    let x0 = inner.x;
-    app.rects.bar = Rect::new(x0, y, bar_w as u16, 1);
-    app.rects.gauge = Rect::new(x0 + (base + gauge_start) as u16, y, 6, 1);
-    app.rects.shuffle = Rect::new(x0 + (base + shuf_start) as u16, y, 2, 1);
-    app.rects.repeat = Rect::new(x0 + (base + rep_start) as u16, y, (rep_end - rep_start) as u16, 1);
-    let _ = gauge_end;
+    app.rects.bar = Rect::new(inner.x + tw as u16 + 1, y2, bar_w as u16, 1);
+    app.rects.seek = Rect::new(inner.x, y2, inner.width, 1);
+    app.rects.gauge = Rect::new(rx + gauge_start as u16, y1, slider_w as u16, 1);
+    app.rects.vol = Rect::new(rx + vol_start as u16, y1, (vol_end - vol_start) as u16, 1);
+    app.rects.shuffle = Rect::new(rx, y1, 2, 1);
+    app.rects.repeat = Rect::new(rx + rep_start as u16, y1, (rep_end - rep_start) as u16, 1);
 }
 
 /// Rows of text under the cover in zen mode: a blank line, the title, the
@@ -993,7 +1068,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
                     }
                     SearchRow::Artist(k) => {
                         let x = &res.artists[k];
-                        Line::from(vec![Span::styled(format!("  {USER} "), th.fg(th.peach)), Span::styled(x.name.clone(), th.fg(th.text)), Span::styled(format!("  {} albums", x.album_count), th.fg(th.dim))])
+                        Line::from(vec![Span::styled(format!("  {USER} "), th.fg(th.blue)), Span::styled(x.name.clone(), th.fg(th.text)), Span::styled(format!("  {} albums", x.album_count), th.fg(th.dim))])
                     }
                 })
             };
@@ -1062,7 +1137,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
                     Span::styled("plays total  ·  ", th.fg(th.dim)),
                     Span::styled(format!("{} ", s.week_total), th.bold(th.blue)),
                     Span::styled("this week  ·  ", th.fg(th.dim)),
-                    Span::styled(format!("\u{f06d} {} day streak", s.streak), th.fg(th.peach)),
+                    Span::styled(format!("\u{f06d} {} day streak", s.streak), th.fg(th.blue)),
                 ]));
                 lines.push(Line::from(vec![Span::styled(format!(" last {} days  ", s.days_window), th.fg(th.dim)), Span::styled(stats::sparkline(&s.per_day), th.fg(th.lav))]));
                 lines.push(Line::from(""));
@@ -1116,6 +1191,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect, th: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Scrub;
     use crate::art::{Art, ArtMode};
     use crate::config::{AppDirs, Settings};
     use crate::models::Song;
@@ -1231,7 +1307,7 @@ mod tests {
                     assert_eq!(r.x, w - (r.x + r.width), "{ctx}: left gap != right gap");
                     // the picture must fit its box in pixels (the bug: it didn't once the font size changed)
                     assert!(plan.key.side <= w as u32 * cell.0 as u32 && plan.key.side <= r.height as u32 * cell.1 as u32 + cell.1 as u32, "{ctx}");
-                    let (area_top, area_h) = (1u16, h - 6);
+                    let (area_top, area_h) = (1u16, h - CHROME_ROWS);
                     let group = r.height + ZEN_TEXT_ROWS;
                     let top_gap = r.y - area_top;
                     let bottom_gap = area_h.saturating_sub(group + top_gap);
@@ -1270,17 +1346,27 @@ mod tests {
     }
 
     #[test]
-    fn repeat_glyph_keeps_a_gap_before_the_right_border() {
+    fn repeat_glyph_keeps_a_gap_before_the_speaker() {
+        // Nerd-font glyphs are width 1 to us but often draw wider: whatever follows
+        // one needs a blank cell, with or without the repeat-one ¹ marker.
         let mut app = test_app(ArtMode::HalfCell);
         app.zen = false;
-        app.queue.repeat = crate::queue::Repeat::One;
-        for w in [100u16, 150] {
-            let t = render(&mut app, w, 42);
-            let y = find_row(&t, "vol").unwrap();
-            let row: Vec<char> = row_text(&t, y).chars().collect();
-            let border = row.iter().rposition(|c| *c == '│').unwrap();
-            let last_glyph = row[..border].iter().rposition(|c| *c != ' ').unwrap();
-            assert!(border - last_glyph >= 3, "{w} cols: only {} blank cells before the border", border - last_glyph - 1);
+        for (repeat, mark) in [(crate::queue::Repeat::One, true), (crate::queue::Repeat::All, false), (crate::queue::Repeat::Off, false)] {
+            app.queue.repeat = repeat;
+            for w in [100u16, 150] {
+                let t = render(&mut app, w, 42);
+                let y = find_row(&t, "now playing").unwrap() + 1;
+                let row: Vec<char> = row_text(&t, y).chars().collect();
+                let rep = row.iter().position(|c| *c == REPEAT.chars().next().unwrap()).unwrap();
+                let spk = row.iter().position(|c| *c == VOL_HIGH.chars().next().unwrap() || *c == VOL_MED.chars().next().unwrap()).unwrap();
+                assert_eq!(row[rep + 1] == '¹', mark, "{w} cols");
+                assert!(spk - rep >= 4, "{w} cols: repeat and speaker only {} cells apart", spk - rep);
+                // the speaker and the shuffle glyph each have a blank cell after them too
+                assert_eq!(row[spk + 1], ' ');
+                let shuf = row.iter().position(|c| *c == SHUFFLE.chars().next().unwrap()).unwrap();
+                assert_eq!(row[shuf + 1], ' ');
+                assert_eq!(row[row.len() - 2], ' ', "{w} cols: padding column before the border is blank");
+            }
         }
     }
 
@@ -1758,5 +1844,406 @@ mod tests {
         let _ = render(&mut app, 140, 40);
         assert!(app.sixel.show.as_ref().is_some_and(|s| !s.preview), "no downgrade to the preview when the size is unchanged");
         assert!(app.sixel.preview.is_none(), "and no preview was even encoded");
+    }
+
+    // ── now-playing strip ─────────────────────────────────────────────
+
+    fn mouse(kind: crossterm::event::MouseEventKind, x: u16, y: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent { kind, column: x, row: y, modifiers: crossterm::event::KeyModifiers::NONE }
+    }
+    fn classic(w: u16, h: u16) -> (App, Terminal<TestBackend>) {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.player.set_volume(100);
+        let t = render(&mut app, w, h);
+        (app, t)
+    }
+
+    #[test]
+    fn speaker_icon_has_four_states() {
+        assert_eq!(vol_icon(0, false), VOL_MUTE);
+        assert_eq!(vol_icon(80, true), VOL_MUTE, "muted wins over the level");
+        assert_eq!(vol_icon(1, false), VOL_LOW);
+        assert_eq!(vol_icon(33, false), VOL_LOW);
+        assert_eq!(vol_icon(34, false), VOL_MED);
+        assert_eq!(vol_icon(66, false), VOL_MED);
+        assert_eq!(vol_icon(67, false), VOL_HIGH);
+        assert_eq!(vol_icon(130, false), VOL_HIGH);
+        let all = [VOL_MUTE, VOL_LOW, VOL_MED, VOL_HIGH];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn now_playing_keeps_its_four_row_box_with_times_either_side_of_the_line() {
+        let (h, w) = (30u16, 100u16);
+        let (app, t) = classic(w, h);
+        assert_eq!((NOW_ROWS, CHROME_ROWS), (4, 6), "the box keeps its original height");
+        let top = find_row(&t, "now playing").expect("label");
+        assert_eq!(top, h - 1 - NOW_ROWS, "box is the four rows above the footer");
+        assert!(row_text(&t, top + 3).contains('╰') || row_text(&t, top + 3).contains('└'), "bottom border is still there");
+        // what is inside the side borders
+        let inside = |y: u16| -> String {
+            let r: Vec<char> = row_text(&t, y).chars().collect();
+            r[1..r.len() - 1].iter().collect()
+        };
+        let (title, line) = (inside(top + 1), inside(top + 2));
+        // elapsed on the left, total on the right, one dot on the line between them
+        assert!(line.trim_start().starts_with("0:10"), "{line:?}");
+        assert!(line.trim_end().ends_with("0:00"), "{line:?}");
+        assert_eq!(line.matches('●').count(), 1, "{line:?}");
+        assert!(line.contains('━') || line.contains('─'));
+        assert!(!line.contains('█'), "no blocky bar any more");
+        // title row: the controls are right-aligned, in the order shuffle, repeat, speaker, slider, percent
+        let (sh, rp, sp, pc) = (
+            title.find(SHUFFLE).unwrap(),
+            title.find(REPEAT).unwrap(),
+            title.find(VOL_HIGH).unwrap(),
+            title.find("100%").unwrap(),
+        );
+        assert!(sh < rp && rp < sp && sp < pc, "{title:?}");
+        assert!(title.contains("Zen Title"));
+        assert_eq!(title.trim_end().chars().count() as u16, w - 3, "percent ends one padding column in from the border");
+        // hit-boxes agree with what was drawn
+        let r = &app.rects;
+        assert_eq!((r.bar.y, r.seek.y), (top + 2, top + 2));
+        assert_eq!((r.gauge.y, r.vol.y), (top + 1, top + 1));
+        assert!(r.bar.width > 20 && r.gauge.width >= 3);
+        assert!(r.vol.x <= r.gauge.x && r.gauge.x + r.gauge.width <= r.vol.x + r.vol.width);
+        assert!(r.shuffle.x + r.shuffle.width <= r.repeat.x && r.repeat.x + r.repeat.width <= r.vol.x);
+    }
+
+    #[test]
+    fn dot_follows_the_position() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.now_duration = 100.0;
+        let mut last = None;
+        for pos in [0.0, 25.0, 50.0, 100.0] {
+            app.now_position = pos;
+            let t = render(&mut app, 100, 30);
+            let row = find_row(&t, "now playing").unwrap() + 2;
+            let text: Vec<char> = row_text(&t, row).chars().collect();
+            let bar = app.rects.bar;
+            let col = text.iter().position(|c| *c == '●').unwrap() as u16;
+            assert!(col >= bar.x && col < bar.x + bar.width);
+            assert_eq!(col - bar.x, crate::anim::dot_index(pos / 100.0, bar.width as usize) as u16);
+            if let Some(prev) = last {
+                assert!(col > prev, "dot moves right as the track plays");
+            }
+            last = Some(col);
+        }
+    }
+
+    #[test]
+    fn volume_icon_and_percent_follow_the_level_and_mute() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        for (v, icon) in [(100, VOL_HIGH), (50, VOL_MED), (10, VOL_LOW), (0, VOL_MUTE)] {
+            app.player.set_volume(v);
+            let t = render(&mut app, 100, 30);
+            let row = row_text(&t, find_row(&t, "now playing").unwrap() + 1);
+            assert!(row.contains(icon), "{v}: {row:?}");
+            assert!(row.contains(&format!("{v}%")), "{v}: {row:?}");
+        }
+        app.player.set_volume(80);
+        app.player.toggle_mute();
+        let t = render(&mut app, 100, 30);
+        let row = row_text(&t, find_row(&t, "now playing").unwrap() + 1);
+        assert!(row.contains(VOL_MUTE) && row.contains("mute"), "{row:?}");
+        let slider: String = row_text(&t, app.rects.gauge.y).chars().skip(app.rects.gauge.x as usize).take(app.rects.gauge.width as usize).collect();
+        assert!(slider.starts_with('●'), "muted slider rests at zero: {slider:?}");
+    }
+
+    #[test]
+    fn wheel_changes_volume_by_five_and_clicks_reach_both_ends() {
+        use crossterm::event::{MouseButton, MouseEventKind as K};
+        let (mut app, _t) = classic(100, 30);
+        let v = app.rects.vol;
+        app.player.set_volume(50);
+        app.on_mouse(mouse(K::ScrollUp, v.x, v.y));
+        assert_eq!(app.player.volume(), 55);
+        app.on_mouse(mouse(K::ScrollUp, v.x + v.width - 1, v.y));
+        assert_eq!(app.player.volume(), 60);
+        app.on_mouse(mouse(K::ScrollDown, v.x + 1, v.y));
+        app.on_mouse(mouse(K::ScrollDown, v.x + 1, v.y));
+        assert_eq!(app.player.volume(), 50);
+        // the percentage and the icon count as the control, not just the slider
+        let g = app.rects.gauge;
+        app.on_mouse(mouse(K::ScrollDown, g.x + g.width + 2, g.y));
+        assert_eq!(app.player.volume(), 45);
+        // clicking the slider's first/last cell gives 0 / 100, the middle gives about half
+        app.on_mouse(mouse(K::Down(MouseButton::Left), g.x, g.y));
+        assert_eq!(app.player.volume(), 0);
+        app.on_mouse(mouse(K::Down(MouseButton::Left), g.x + g.width - 1, g.y));
+        assert_eq!(app.player.volume(), 100);
+        app.on_mouse(mouse(K::Down(MouseButton::Left), g.x + (g.width - 1) / 2, g.y));
+        assert!((app.player.volume() - 50).abs() <= 6, "{}", app.player.volume());
+        // clamped like the keyboard
+        app.player.set_volume(98);
+        app.on_mouse(mouse(K::ScrollUp, v.x, v.y));
+        app.on_mouse(mouse(K::ScrollUp, v.x, v.y));
+        assert_eq!(app.player.volume(), 108.min(130));
+    }
+
+    #[test]
+    fn wheel_over_the_strip_does_not_scroll_the_lists() {
+        use crossterm::event::MouseEventKind as K;
+        let (mut app, _t) = classic(100, 30);
+        let before = (app.sidebar.selected(), app.queue_state.selected());
+        let (seek, vol) = (app.rects.seek, app.rects.vol);
+        for _ in 0..5 {
+            app.on_mouse(mouse(K::ScrollDown, seek.x + 3, seek.y));
+            app.on_mouse(mouse(K::ScrollUp, vol.x, vol.y));
+        }
+        assert_eq!((app.sidebar.selected(), app.queue_state.selected()), before);
+    }
+
+    #[test]
+    fn strip_is_sane_at_the_narrowest_sizes() {
+        for (zen, w) in [(true, 30u16), (true, 31), (true, 40), (false, 62), (false, 63), (false, 200)] {
+            let mut app = test_app(ArtMode::HalfCell);
+            app.zen = zen;
+            let h = min_size(&app).1 + 2;
+            let t = render(&mut app, w, h);
+            let top = find_row(&t, "now playing").unwrap_or_else(|| panic!("{w}: no strip"));
+            let title = row_text(&t, top + 1);
+            assert!(title.contains('%'), "{w}: {title:?}");
+            let r = &app.rects;
+            for z in [r.bar, r.seek, r.gauge, r.vol, r.shuffle, r.repeat] {
+                assert!(z.x + z.width <= w - 1 && z.y < h, "{w}: {z:?} leaves the strip");
+            }
+            // the controls never overlap each other
+            assert!(r.shuffle.x + r.shuffle.width <= r.repeat.x && r.repeat.x + r.repeat.width <= r.vol.x, "{w}");
+        }
+    }
+
+
+    /// a classic (non-zen) screen with one playlist, a few tracks and a queue
+    fn library_app() -> App {
+        use crate::models::Playlist;
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.playlists = vec![Playlist { id: "p".into(), name: "Jazz Mix".into(), song_count: 12, ..Default::default() }];
+        app.rebuild_sidebar();
+        let song = |i: usize| Song { id: format!("id{i}"), title: format!("Track{i}"), artist: "Band".into(), duration: 100, ..Default::default() };
+        app.songs = (0..4).map(song).collect();
+        app.tracks.select(Some(1));
+        app.queue.set_songs((0..4).map(song).collect(), 1);
+        app.queue_state.select(Some(2));
+        app.focus = Focus::Tracks;
+        app
+    }
+
+    /// (x, y) of the first cell of `needle` on screen
+    fn find_cell(t: &Terminal<TestBackend>, needle: &str) -> (u16, u16) {
+        let y = find_row(t, needle).unwrap_or_else(|| panic!("{needle:?} not on screen"));
+        let row = row_text(t, y);
+        let x = row.find(needle).map(|b| row[..b].chars().count()).unwrap();
+        (x as u16, y)
+    }
+
+    #[test]
+    fn selected_row_is_bold_and_accent_coloured_with_no_background_change() {
+        use ratatui::style::Modifier;
+        let mut app = library_app();
+        let th = app.theme();
+        let t = render(&mut app, 150, 42);
+        let buf = t.backend().buffer();
+        // the tracks cursor is on Track1; Track0/Track2 are plain rows right next to it
+        let (x, y) = find_cell(&t, "Track1  Band");
+        let sel = buf.cell((x, y)).unwrap();
+        assert!(sel.modifier.contains(Modifier::BOLD), "selected text is bold");
+        assert_eq!(sel.fg, th.blue, "selected text takes the theme colour");
+        let (x0, y0) = find_cell(&t, "Track0  Band");
+        let plain = buf.cell((x0, y0)).unwrap();
+        assert!(!plain.modifier.contains(Modifier::BOLD) && plain.fg != th.blue);
+        // the whole row, including its blank tail, keeps the panel background
+        let panel = app.rects.tracks;
+        for xx in panel.x + 1..panel.x + panel.width - 1 {
+            assert_eq!(buf.cell((xx, y)).unwrap().bg, buf.cell((xx, y0)).unwrap().bg, "background differs under the cursor at x={xx}");
+        }
+        // an unfocused panel still marks its cursor, in bold, and still without a background
+        app.focus = Focus::Sidebar;
+        let t = render(&mut app, 150, 42);
+        let buf = t.backend().buffer();
+        let (x, y) = find_cell(&t, "Track1  Band");
+        assert!(buf.cell((x, y)).unwrap().modifier.contains(Modifier::BOLD));
+        assert_eq!(buf.cell((x, y)).unwrap().bg, buf.cell((x0, y0)).unwrap().bg);
+    }
+
+    #[test]
+    fn queue_current_row_shows_the_same_play_pause_icon_as_the_now_playing_line() {
+        {
+            let mut app = library_app();
+            app.focus = Focus::Queue;
+            let t = render(&mut app, 150, 42);
+            let q = app.rects.queue;
+            let slice = |y: u16| -> String { row_text(&t, y).chars().skip(q.x as usize).take(q.width as usize).collect() };
+            let row = (q.y..q.y + q.height).map(slice).find(|r| r.contains("Track1")).expect("current queue row is drawn");
+            // nothing is playing in the test app, so both places show the paused icon
+            let now = find_row(&t, "Zen Title").map(|y| row_text(&t, y)).expect("now-playing line");
+            assert!(now.contains(PAUSE) && !now.contains(PLAY), "{now:?}");
+            assert!(row.contains(PAUSE) && !row.contains(PLAY), "{row:?}");
+            assert!(!row.contains(" 2 "), "the number is replaced by the icon: {row:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_icons_describe_their_category_and_follow_the_accent_colour() {
+        let mut app = library_app();
+        let th = app.theme();
+        let t = render(&mut app, 150, 42);
+        let buf = t.backend().buffer();
+        for (label, glyph) in [
+            ("all tracks", ALL_TRACKS),
+            ("recently added", NEW_ICON),
+            ("recently played", HISTORY),
+            ("most played", MOST_PLAYED),
+            ("Jazz Mix", PLAYLIST),
+            ("starred", STAR),
+        ] {
+            // look only inside the library panel ("all tracks" is also the tracks panel's title)
+            let lib = app.rects.sidebar;
+            let (x, y) = (lib.y..lib.y + lib.height)
+                .find_map(|y| {
+                    let row: String = row_text(&t, y).chars().skip(lib.x as usize).take(lib.width as usize).collect();
+                    row.find(label).map(|b| (lib.x + row[..b].chars().count() as u16, y))
+                })
+                .unwrap_or_else(|| panic!("{label} not in the library panel"));
+            let row = row_text(&t, y);
+            let g = row.chars().nth(x as usize - 2).unwrap();
+            assert_eq!(g.to_string(), glyph, "{label}: wrong icon");
+            assert_eq!(buf.cell((x - 2, y)).unwrap().fg, th.blue, "{label}: icon is not the accent colour");
+        }
+        // no stray count badge next to a playlist (it is a track count, not a play count)
+        let (_, y) = find_cell(&t, "Jazz Mix");
+        let lib = app.rects.sidebar;
+        let row: String = row_text(&t, y).chars().skip(lib.x as usize).take(lib.width as usize).collect();
+        assert!(!row.contains("12") && !row.contains('♪'), "{row:?}");
+    }
+
+    #[test]
+    fn glyph_constants_are_the_requested_ones() {
+        assert_eq!(PLAYLIST, "\u{f0cb8}");
+        assert_eq!(DOWNLOAD, "\u{f019}");
+        assert_eq!(ALL_TRACKS, "\u{f188e}");
+        let all = [ALL_TRACKS, NEW_ICON, HISTORY, MOST_PLAYED, STAR, SHUFFLE, PLAYLIST];
+        for (i, a) in all.iter().enumerate() {
+            assert!(all.iter().skip(i + 1).all(|b| a != b), "two sidebar icons are the same: {a:?}");
+        }
+    }
+
+    #[test]
+    fn the_volume_slider_slides_under_a_held_button() {
+        use crossterm::event::{MouseButton::Left, MouseEventKind as K};
+        let (mut app, _t) = classic(100, 30);
+        let g = app.rects.gauge;
+        assert!(g.width >= 8);
+        app.on_mouse(mouse(K::Down(Left), g.x, g.y));
+        assert_eq!((app.player.volume(), app.scrub), (0, Some(Scrub::Volume)));
+        let mut last = 0;
+        for c in 0..g.width {
+            app.on_mouse(mouse(K::Drag(Left), g.x + c, g.y));
+            let want = (crate::anim::fraction_at(c as usize, g.width as usize) * 100.0).round() as i64;
+            assert_eq!(app.player.volume(), want, "column {c}");
+            assert!(app.player.volume() >= last);
+            last = app.player.volume();
+        }
+        // the pointer may wander off the slider — up/down the screen and past either end
+        app.on_mouse(mouse(K::Drag(Left), g.x + g.width + 20, 0));
+        assert_eq!(app.player.volume(), 100);
+        app.on_mouse(mouse(K::Drag(Left), 0, g.y + 3));
+        assert_eq!(app.player.volume(), 0);
+        app.on_mouse(mouse(K::Drag(Left), g.x + g.width / 2, g.y + 5));
+        let mid = app.player.volume();
+        assert!((40..=60).contains(&mid), "{mid}");
+        // releasing ends it: more motion changes nothing
+        app.on_mouse(mouse(K::Up(Left), g.x + g.width / 2, g.y));
+        assert_eq!(app.scrub, None);
+        app.on_mouse(mouse(K::Drag(Left), g.x, g.y));
+        assert_eq!(app.player.volume(), mid);
+    }
+
+    #[test]
+    fn a_drag_that_starts_elsewhere_never_touches_the_controls() {
+        use crossterm::event::{MouseButton::Left, MouseEventKind as K};
+        let (mut app, _t) = classic(100, 30);
+        let (g, b) = (app.rects.gauge, app.rects.bar);
+        app.player.set_volume(42);
+        app.on_mouse(mouse(K::Down(Left), 3, 3)); // on a panel
+        for x in [g.x, g.x + g.width - 1, b.x + 5] {
+            app.on_mouse(mouse(K::Drag(Left), x, g.y));
+        }
+        assert_eq!((app.player.volume(), app.scrub), (42, None));
+    }
+
+    #[test]
+    fn the_seek_line_follows_the_pointer_while_held_and_lets_go_on_release() {
+        use crossterm::event::{MouseButton::Left, MouseEventKind as K};
+        let mut app = test_app(ArtMode::HalfCell);
+        app.zen = false;
+        app.now_duration = 100.0;
+        let mut t = render(&mut app, 100, 30);
+        let b = app.rects.bar;
+        let line_y = b.y;
+        let read = |t: &Terminal<TestBackend>| {
+            let row: Vec<char> = row_text(t, line_y).chars().collect();
+            let dot = row.iter().position(|c| *c == '●').unwrap() as u16;
+            let label: String = row.iter().skip(2).take(4).collect::<String>().trim().to_string();
+            (dot, label)
+        };
+        assert_eq!(read(&t).1, "0:10");
+        // press in the middle: the dot and the elapsed label jump there at once
+        let mid = b.x + (b.width - 1) / 2;
+        app.on_mouse(mouse(K::Down(Left), mid, line_y));
+        assert_eq!(app.scrub, Some(Scrub::Seek));
+        t = render(&mut app, 100, 30);
+        let (dot, label) = read(&t);
+        assert_eq!(dot, mid);
+        assert!(label.starts_with("0:4") || label.starts_with("0:5"), "{label}");
+        // drag to the far end — even with the pointer well below the line — then back past the start
+        app.on_mouse(mouse(K::Drag(Left), b.x + b.width + 9, line_y + 8));
+        t = render(&mut app, 100, 30);
+        assert_eq!(read(&t), (b.x + b.width - 1, "1:40".to_string()));
+        app.on_mouse(mouse(K::Drag(Left), 0, line_y));
+        t = render(&mut app, 100, 30);
+        assert_eq!(read(&t), (b.x, "0:00".to_string()));
+        // let go: back to what the player says (the null player can't have moved)
+        app.on_mouse(mouse(K::Up(Left), 0, line_y));
+        assert_eq!(app.scrub, None);
+        t = render(&mut app, 100, 30);
+        assert_eq!(read(&t).1, "0:10");
+    }
+
+    #[test]
+    fn reports_that_predate_our_own_seek_are_ignored_briefly() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.set_position(50.0);
+        app.seek_hold = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        app.on_position(10.0, 100.0); // from before the seek, still in flight
+        assert_eq!(app.now_position, 50.0);
+        app.on_position(50.4, 100.0); // after it
+        assert_eq!(app.now_position, 50.4);
+        assert!(app.seek_hold.is_none(), "the first report that fits ends the hold");
+        app.on_position(10.0, 100.0); // later jumps are real (a seek made elsewhere)
+        assert_eq!(app.now_position, 10.0);
+        // an expired hold lets everything through
+        app.seek_hold = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.on_position(80.0, 100.0);
+        assert_eq!(app.now_position, 80.0);
+    }
+
+    #[test]
+    fn resetting_the_position_stops_extrapolating_until_a_real_report() {
+        let mut app = test_app(ArtMode::HalfCell);
+        app.on_position(30.0, 100.0);
+        assert!(app.pos_report.is_some());
+        app.set_position(0.0);
+        assert_eq!((app.now_position, app.shown_pos), (0.0, 0.0));
+        assert!(app.pos_report.is_none());
     }
 }

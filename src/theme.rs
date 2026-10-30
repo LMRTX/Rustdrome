@@ -1,9 +1,11 @@
-//! The five kit themes and their palette roles.
+//! The seven kit themes and their palette roles.
 //!
 //! Every theme defines the same roles (text/sub/dim/…/yellow plus chrome
 //! colors). `clear` and `system` use the terminal's own background
 //! (`Color::Reset`); `system` additionally uses the terminal's ANSI palette,
 //! so gradients and shimmers degrade to flat colors there (`ansi == true`).
+//! `ice clear` and `tiger clear` are `clear` with a fixed accent color that
+//! the album-art tint never touches (`track_tint == false`).
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::BorderType;
@@ -13,6 +15,8 @@ pub struct Theme {
     pub name: &'static str,
     /// terminal-native palette: nothing honest to blend
     pub ansi: bool,
+    /// whether the album-art tint may recolour the accents (`tinted`)
+    pub track_tint: bool,
     pub bg: Color,
     pub text: Color,
     pub sub: Color,
@@ -21,7 +25,6 @@ pub struct Theme {
     pub vfaint: Color,
     pub blue: Color,
     pub lav: Color,
-    pub peach: Color,
     pub green: Color,
     pub red: Color,
     pub mauve: Color,
@@ -30,7 +33,6 @@ pub struct Theme {
     pub border_focus: Color,
     pub border_alt: Color,
     pub modal_bg: Color,
-    pub cursor: Color,
     /// `Rounded` (default) or `Plain` (square corners) — every box uses this
     pub bt: BorderType,
 }
@@ -57,6 +59,7 @@ pub fn blend(a: Color, b: Color, t: f64) -> Color {
 const MOCHA: Theme = Theme {
     name: "mocha",
     ansi: false,
+    track_tint: true,
     bg: Color::Rgb(0x1e, 0x1e, 0x2e),
     text: Color::Rgb(0xcd, 0xd6, 0xf4),
     sub: Color::Rgb(0xa6, 0xad, 0xc8),
@@ -65,7 +68,6 @@ const MOCHA: Theme = Theme {
     vfaint: Color::Rgb(0x31, 0x32, 0x44),
     blue: Color::Rgb(0x89, 0xb4, 0xfa),
     lav: Color::Rgb(0xb4, 0xbe, 0xfe),
-    peach: Color::Rgb(0xfa, 0xb3, 0x87),
     green: Color::Rgb(0xa6, 0xe3, 0xa1),
     red: Color::Rgb(0xf3, 0x8b, 0xa8),
     mauve: Color::Rgb(0xcb, 0xa6, 0xf7),
@@ -74,7 +76,6 @@ const MOCHA: Theme = Theme {
     border_focus: Color::Rgb(0x89, 0xb4, 0xfa),
     border_alt: Color::Rgb(0xb4, 0xbe, 0xfe),
     modal_bg: Color::Rgb(0x18, 0x18, 0x25),
-    cursor: Color::Rgb(0x3e, 0x48, 0x69),
     bt: BorderType::Rounded,
 };
 
@@ -83,7 +84,6 @@ const VOID: Theme = Theme {
     bg: Color::Rgb(0, 0, 0),
     border: Color::Rgb(0x26, 0x26, 0x2e),
     modal_bg: Color::Rgb(0x0a, 0x0a, 0x10),
-    cursor: Color::Rgb(0x1e, 0x2a, 0x4a),
     vfaint: Color::Rgb(0x31, 0x32, 0x44),
     ..MOCHA
 };
@@ -99,7 +99,6 @@ const ONYX: Theme = Theme {
     border_focus: Color::Rgb(0x9a, 0xa5, 0xb5),
     border_alt: Color::Rgb(0xb8, 0xc0, 0xcc),
     modal_bg: Color::Rgb(0x14, 0x14, 0x19),
-    cursor: Color::Rgb(0x2b, 0x30, 0x3b),
     ..MOCHA
 };
 
@@ -114,14 +113,37 @@ const CLEAR: Theme = Theme {
     border_focus: Color::Rgb(0x8a, 0x93, 0xa5),
     border_alt: Color::Rgb(0xa9, 0xb1, 0xc0),
     modal_bg: Color::Rgb(0x16, 0x16, 0x1d),
-    cursor: Color::Rgb(0x28, 0x2c, 0x38),
     ..MOCHA
+};
+
+// `clear`, but the accents stay ice white whatever the cover looks like
+const ICE_CLEAR: Theme = Theme {
+    name: "ice clear",
+    track_tint: false,
+    blue: Color::Rgb(0xe6, 0xf3, 0xff),
+    lav: Color::Rgb(0xf5, 0xfa, 0xff),
+    mauve: Color::Rgb(0xc4, 0xd9, 0xea),
+    border_focus: Color::Rgb(0xe6, 0xf3, 0xff),
+    border_alt: Color::Rgb(0xf5, 0xfa, 0xff),
+    ..CLEAR
+};
+
+// `ice clear` with Claude orange (#d97757) as the accent instead
+const TIGER_CLEAR: Theme = Theme {
+    name: "tiger clear",
+    blue: Color::Rgb(0xd9, 0x77, 0x57),
+    lav: Color::Rgb(0xe8, 0x95, 0x76),
+    mauve: Color::Rgb(0xb0, 0x5d, 0x42),
+    border_focus: Color::Rgb(0xd9, 0x77, 0x57),
+    border_alt: Color::Rgb(0xe8, 0x95, 0x76),
+    ..ICE_CLEAR
 };
 
 // the terminal's own ANSI palette + no background
 const SYSTEM: Theme = Theme {
     name: "system",
     ansi: true,
+    track_tint: false,
     bg: Color::Reset,
     text: Color::Reset,
     sub: Color::Gray,
@@ -130,7 +152,6 @@ const SYSTEM: Theme = Theme {
     vfaint: Color::DarkGray,
     blue: Color::Blue,
     lav: Color::LightBlue,
-    peach: Color::Yellow,
     green: Color::Green,
     red: Color::Red,
     mauve: Color::Magenta,
@@ -139,11 +160,10 @@ const SYSTEM: Theme = Theme {
     border_focus: Color::Blue,
     border_alt: Color::LightBlue,
     modal_bg: Color::Black,
-    cursor: Color::DarkGray,
     bt: BorderType::Rounded,
 };
 
-pub const THEMES: [Theme; 5] = [MOCHA, VOID, ONYX, CLEAR, SYSTEM];
+pub const THEMES: [Theme; 7] = [MOCHA, VOID, ONYX, CLEAR, ICE_CLEAR, TIGER_CLEAR, SYSTEM];
 
 pub fn by_name(name: &str) -> Theme {
     THEMES.iter().copied().find(|t| t.name == name).unwrap_or(MOCHA)
@@ -157,9 +177,10 @@ pub fn next_theme(name: &str) -> Theme {
 impl Theme {
     /// Nudge `blue`/`lav`/`mauve` toward an album color so borders, the
     /// progress bar and the now-playing line quietly take on the cover's hue.
-    /// A no-op under the ANSI theme (nothing to blend).
+    /// A no-op under the ANSI theme (nothing to blend) and under themes with a
+    /// fixed accent (`track_tint == false`: ice clear, tiger clear).
     pub fn tinted(mut self, tint: Option<Color>) -> Self {
-        if let (Some(t), false) = (tint, self.ansi) {
+        if let (Some(t), true, false) = (tint, self.track_tint, self.ansi) {
             self.blue = blend(self.blue, t, 0.55);
             self.lav = blend(self.lav, t, 0.50);
             self.mauve = blend(self.mauve, t, 0.45);
@@ -222,8 +243,44 @@ mod tests {
     }
 
     #[test]
+    fn fixed_accent_themes_ignore_the_cover_tint() {
+        let red = Some(Color::Rgb(255, 0, 0));
+        for n in ["ice clear", "tiger clear"] {
+            let t = by_name(n);
+            assert_eq!(t.name, n, "{n} must be selectable by name");
+            let u = t.tinted(red);
+            assert_eq!((u.blue, u.lav, u.mauve), (t.blue, t.lav, t.mauve), "{n} is tinted");
+            assert_eq!(t.bg, Color::Reset, "{n} keeps the terminal background");
+        }
+        // plain clear still follows the cover
+        let c = by_name("clear");
+        assert_ne!(c.tinted(red).blue, c.blue);
+    }
+
+    #[test]
+    fn ice_is_white_and_tiger_is_claude_orange() {
+        let ice = by_name("ice clear");
+        let tiger = by_name("tiger clear");
+        let (r, g, b) = rgb_of(ice.blue).unwrap();
+        assert!(r > 0xd0 && g > 0xd0 && b > 0xd0 && b >= r, "ice accent should be a bluish white");
+        assert_eq!(tiger.blue, Color::Rgb(0xd9, 0x77, 0x57));
+        assert_eq!(tiger.border_focus, tiger.blue);
+        assert_eq!((tiger.text, tiger.bg), (ice.text, ice.bg), "only the accent differs");
+    }
+
+    #[test]
+    fn theme_names_are_unique() {
+        for (i, a) in THEMES.iter().enumerate() {
+            assert!(THEMES.iter().skip(i + 1).all(|b| b.name != a.name), "duplicate {}", a.name);
+        }
+    }
+
+    #[test]
     fn theme_cycle_wraps() {
         assert_eq!(next_theme("system").name, "mocha");
         assert_eq!(next_theme("mocha").name, "void");
+        assert_eq!(next_theme("clear").name, "ice clear");
+        assert_eq!(next_theme("ice clear").name, "tiger clear");
+        assert_eq!(next_theme("tiger clear").name, "system");
     }
 }
