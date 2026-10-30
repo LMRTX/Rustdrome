@@ -54,8 +54,7 @@ sudo dnf install mpv
 
 **[Github releases page](https://github.com/mpv-player/mpv/releases)**
 
-Move the `mpv.exe` file to somewhere in `Path`.
-For example move it to `C:\Tools\` and add that folder to the user `Path`.
+Move the `mpv.exe` file to somewhere in user `Path`.
 
 ### Precompiled Unix binary
 
