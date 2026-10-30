@@ -74,7 +74,7 @@ The precompiled binary targets **Windows 11** and **Windows 10** systems.
 
 The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
 
-For convenient acess, move the executable to somewhere on your `Path` for example in to the folder `C:\Tools\` mentioned earlier.
+For convenient acess, move the executable to somewhere on your `Path`.
 
 If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
