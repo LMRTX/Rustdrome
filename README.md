@@ -74,7 +74,7 @@ Then just launch the application with `rustdrome` in your terminal.
 
 - The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
 
-- For convenient acess, move the executable to somewhere on your `Path`.
+- For convenient access, move the executable to somewhere on your `Path`.
 
 - If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
