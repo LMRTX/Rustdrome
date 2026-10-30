@@ -52,7 +52,10 @@ sudo dnf install mpv
 
 **Windows 11**
 (https://github.com/mpv-player/mpv/releases/download/git-release/mpv-v0.41.0-dev-g18091d351-40927902575-x86_64-w64-mingw32-full.zip)
-Move the `mpv.exe` file to somewhere in `Path`. For example move it to `C:\Tools\` and add that folder to the user `Path`.
+
+Move the `mpv.exe` file to somewhere in `Path`.
+
+For example move it to `C:\Tools\` and add that folder to the user `Path`.
 
 ### Precompiled Unix binary
 
@@ -71,7 +74,9 @@ Then just launch the application with `rustdrome` in your terminal.
 The precompiled binary targets **Windows 11** and **Windows 10** systems.
 
 The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
+
 For convenient acess, move the executable to somewhere on your `Path` for example in to the folder `C:\Tools\` mentioned earlier.
+
 If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
 ## Building from Source
