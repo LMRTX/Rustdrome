@@ -52,7 +52,7 @@ sudo dnf install mpv
 
 **Windows 11**
 
-### [Github releases page](https://github.com/mpv-player/mpv/releases)
+#### [Github releases page](https://github.com/mpv-player/mpv/releases)
 
 Move the `mpv.exe` file to somewhere in `Path`.
 
