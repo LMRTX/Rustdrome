@@ -70,13 +70,13 @@ Then just launch the application with `rustdrome` in your terminal.
 
 ### Precompiled Windows executable
 
-The precompiled binary targets **Windows 11** and **Windows 10** systems.
+- The precompiled binary targets **Windows 11** and **Windows 10** systems.
 
-The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
+- The executable can be ran from anywhere and will run Rustdrome in default terminal. (usually Windows Terminal)
 
-For convenient acess, move the executable to somewhere on your `Path`.
+- For convenient acess, move the executable to somewhere on your `Path`.
 
-If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
+- If Rustdrome is in `Path` you can run it from any terminal window with `rustdrome`.
 
 ## Building from Source
 
