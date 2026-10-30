@@ -240,8 +240,6 @@ Configuration files containing authentication tokens should be protected with re
 - Customize settings and keybindings through `player.toml`.
 - Receive desktop notifications when tracks change.
 
-
-
 ## How It Works
 
 Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
@@ -252,16 +250,6 @@ Rustdrome combines Rust, ratatui, and mpv into a compact terminal music player.
 - **Persistence:** configuration, application state, queue data, and caches are stored locally.
 - **Offline synchronization:** supported mutations are queued locally and synced when the server becomes available again.
 
-## Differences from NaviTui
-
-Rustdrome started as a rewrite of [NaviTui](https://github.com/Gheat1/NaviTui), preserving its existing file formats and much of its functionality while changing the implementation language and terminal UI framework.
-
-| Area | NaviTui | Rustdrome |
-|---|---|---|
-| Language | Python | Rust |
-| Terminal UI | Textual | ratatui |
-| Playback integration | Python bindings to libmpv | mpv child process over JSON IPC |
-| Cover art | Multiple protocols, including Kitty graphics | Sixel or half-cell blocks |
 
 ## License
 
